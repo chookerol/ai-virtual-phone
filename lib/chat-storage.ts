@@ -83,6 +83,8 @@ export type ChatMessage = {
     role: ChatMessageRole;
     content: string;
     status: ChatMessageStatus;
+    /** 本机未读状态；旧消息缺省为已读，不沿用云端的阅读状态。 */
+    unread?: boolean;
     createdAt: string; // ISO date
     order?: number; // Stable per-session display order
     responseBatchId?: string; // Assistant raw-response batch id
@@ -271,6 +273,7 @@ export function getMaxToolRounds(): number {
 
 export const CHAT_APP_SETTINGS_UPDATED_EVENT = "chat-app-settings-updated";
 export const CHAT_MESSAGE_PUSHED_EVENT = "chat-message-pushed";
+export const CHAT_UNREAD_UPDATED_EVENT = "chat-unread-updated";
 export const CHAT_MESSAGES_DELETED_EVENT = "chat-messages-deleted";
 export const CHAT_REQUEST_REPLY_EVENT = "chat-request-reply";
 /** 长按编辑整批回复后重建消息：携带新消息与编辑后的原文，供云同步回写。 */
@@ -431,6 +434,50 @@ function isSessionPreviewCandidate(msg: ChatMessage): boolean {
     if (hasPreviewText(msg.statusPanel) || hasPreviewText(msg.innerMonologue) || hasPreviewText(msg.reasoningText)) return true;
 
     return false;
+}
+
+/** Only incoming, visible character bubbles contribute to the avatar badge. */
+function isUnreadMessageCandidate(msg: ChatMessage): boolean {
+    if (msg.role !== "assistant" || msg.isRetracted || !isSessionPreviewCandidate(msg)) return false;
+    if (msg.mediaType === "system_instruction") return false;
+    if (["poke", "accept_red_packet", "decline_red_packet", "accept_transfer", "decline_transfer",
+        "accept_payment_request", "decline_payment_request", "group_admin_notice"].includes(msg.mediaType || "")) return false;
+    return !/\[我(?:向.+)?(?:发起了|挂断了|拒绝了|取消了)(?:群?(?:语音|视频)通话)/.test(msg.content);
+}
+
+const chatSessionReaders = new Map<symbol, string>();
+
+function isChatSessionBeingRead(sessionId: string): boolean {
+    return typeof document !== "undefined" && document.visibilityState === "visible"
+        && [...chatSessionReaders.values()].includes(sessionId);
+}
+
+function dispatchUnreadUpdated(sessionId: string): void {
+    if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent(CHAT_UNREAD_UPDATED_EVENT, { detail: { sessionId } }));
+    }
+}
+
+export function markChatSessionRead(sessionId: string): void {
+    const changed: ChatMessage[] = [];
+    _messagesCache = _messagesCache.map(message => {
+        if (message.sessionId !== sessionId || !message.unread) return message;
+        const read = { ...message, unread: false };
+        changed.push(read);
+        return read;
+    });
+    if (!changed.length) return;
+    dbPutMessages(changed);
+    loadChatSessions(); // Recount and persist without changing the conversation's activity time.
+    dispatchUnreadUpdated(sessionId);
+}
+
+/** Each visible main/mini chat owns its registration; hidden cached rooms must not register. */
+export function registerChatSessionReader(sessionId: string): () => void {
+    const token = Symbol(sessionId);
+    chatSessionReaders.set(token, sessionId);
+    if (isChatSessionBeingRead(sessionId)) markChatSessionRead(sessionId);
+    return () => { chatSessionReaders.delete(token); };
 }
 
 function getStableMessageOrder(msg: ChatMessage): number | null {
@@ -909,15 +956,23 @@ function normalizeLegacyTextToolHistory(messages: ChatMessage[]): {
 
 function refreshSessionPreviewMetadata(sessions: ChatSession[]): NormalizedList<ChatSession> {
     let changed = false;
+    const unreadCounts = new Map<string, number>();
+    for (const message of _messagesCache) {
+        if (message.unread && isUnreadMessageCandidate(message)) {
+            unreadCounts.set(message.sessionId, (unreadCounts.get(message.sessionId) || 0) + 1);
+        }
+    }
     const items = sessions.map(session => {
         const lastMsg = getLastVisibleSessionMessage(session.id);
         const nextLastMessageId = lastMsg?.id;
         const nextPreview = lastMsg ? getChatMessagePreview(lastMsg) : "";
         const nextUpdatedAt = lastMsg?.createdAt || session.updatedAt;
+        const unreadCount = unreadCounts.get(session.id) || 0;
         if (
             session.lastMessageId === nextLastMessageId
             && (session.lastMessagePreview || "") === nextPreview
             && session.updatedAt === nextUpdatedAt
+            && session.unreadCount === unreadCount
         ) {
             return session;
         }
@@ -927,6 +982,7 @@ function refreshSessionPreviewMetadata(sessions: ChatSession[]): NormalizedList<
             lastMessageId: nextLastMessageId,
             lastMessagePreview: nextPreview,
             updatedAt: nextUpdatedAt,
+            unreadCount,
         };
     });
     return { items, changed };
@@ -1149,6 +1205,7 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
         newMsg = pluginResult.message;
     }
 
+    newMsg.unread = isUnreadMessageCandidate(newMsg) && !isChatSessionBeingRead(newMsg.sessionId);
     _messagesCache.push(newMsg);
     dbPutMessage(newMsg);
 
@@ -1168,6 +1225,7 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
     if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent(CHAT_MESSAGE_PUSHED_EVENT, { detail: { message: newMsg } }));
     }
+    if (newMsg.unread) dispatchUnreadUpdated(newMsg.sessionId);
     emitChatPluginEvent("message.persisted", { message: newMsg });
 
     return newMsg;
@@ -1184,6 +1242,7 @@ export function upsertImportedChatMessage(msg: ChatMessage): { message: ChatMess
         order: typeof msg.order === "number" ? msg.order : getNextMessageOrder(msg.sessionId),
     };
 
+    newMsg.unread = isUnreadMessageCandidate(newMsg) && !isChatSessionBeingRead(newMsg.sessionId);
     _messagesCache.push(newMsg);
     dbPutMessage(newMsg);
 
@@ -1200,6 +1259,7 @@ export function upsertImportedChatMessage(msg: ChatMessage): { message: ChatMess
         }
     }
 
+    if (newMsg.unread) dispatchUnreadUpdated(newMsg.sessionId);
     return { message: newMsg, inserted: true };
 }
 
@@ -1515,6 +1575,7 @@ export function editChatMessage(messageId: string, newContent: string) {
             sessions[sessIdx].lastMessagePreview = getChatMessagePreview(lastMsg);
             saveChatSessions(sessions);
         }
+        dispatchUnreadUpdated(sessionId);
     }
 }
 
@@ -1533,6 +1594,7 @@ export function retractChatMessage(messageId: string) {
             sessions[sessIdx].lastMessagePreview = "撤回了一条消息";
             saveChatSessions(sessions);
         }
+        dispatchUnreadUpdated(sessionId);
     }
 }
 
@@ -1555,6 +1617,7 @@ export function clearChatSessionMessages(sessionId: string) {
 
 function dispatchDeletedMessages(messages: ChatMessage[]): void {
     if (typeof window === "undefined" || messages.length === 0) return;
+    for (const sessionId of new Set(messages.map(message => message.sessionId))) dispatchUnreadUpdated(sessionId);
     window.dispatchEvent(new CustomEvent(CHAT_MESSAGES_DELETED_EVENT, { detail: { messages } }));
     for (const message of messages) {
         emitChatPluginEvent("message.deleted", { id: message.id, sessionId: message.sessionId });
@@ -1789,6 +1852,7 @@ export function updateChatMessage(
         saveChatSessions(sessions);
     }
 
+    dispatchUnreadUpdated(updated.sessionId);
     emitChatPluginEvent("message.updated", { id: messageId, patch });
 
     return updated;
@@ -1887,6 +1951,7 @@ export function replaceMessageWithParts(
             origin: original.origin,
             mediaData: parts[i].mediaData,
             status: original.status,
+            unread: original.unread,
             createdAt: original.createdAt,
             order: baseOrder + i * 0.001,
             responseBatchId: original.responseBatchId,
@@ -1908,6 +1973,8 @@ export function replaceMessageWithParts(
     }
 
     reindexSessionMessageOrders(original.sessionId);
+    loadChatSessions();
+    dispatchUnreadUpdated(original.sessionId);
     const newIds = new Set(newMsgs.map(msg => msg.id));
     return getSortedSessionMessages(original.sessionId).filter(msg => newIds.has(msg.id));
 }
@@ -1955,6 +2022,7 @@ export function replaceResponseBatchWithParts(
         origin: firstMessage.origin,
         mediaData: part.mediaData,
         status: firstMessage.status,
+        unread: batchMessages.some(message => message.unread),
         createdAt: new Date(baseTime + index).toISOString(),
         order: baseOrder + index * 0.001,
         responseBatchId,
@@ -2025,6 +2093,7 @@ export function replaceResponseBatchWithParts(
  * 由云同步侧「就地覆盖同一条云消息」。
  */
 function dispatchResponseBatchReplaced(sessionId: string, messages: ChatMessage[], rawResponseText: string): void {
+    dispatchUnreadUpdated(sessionId);
     if (typeof window === "undefined" || messages.length === 0) return;
     window.dispatchEvent(new CustomEvent(CHAT_RESPONSE_BATCH_REPLACED_EVENT, {
         detail: { sessionId, messages, rawResponseText },
@@ -2077,6 +2146,7 @@ export function replaceGroupResponseRound(
         origin: firstMessage.origin,
         mediaData: msg.mediaData,
         status: firstMessage.status,
+        unread: roundMessages.some(message => message.unread),
         createdAt: new Date(baseTime + index).toISOString(),
         order: baseOrder + index * 0.001,
         responseBatchId: msg.responseBatchId,
@@ -2114,6 +2184,7 @@ export function replaceGroupResponseRound(
         saveChatSessions(sessions);
     }
 
+    dispatchUnreadUpdated(sessionId);
     return newMessages;
 }
 

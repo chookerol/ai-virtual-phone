@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useSyncExternalStore } from "react";
 import { ChevronLeft } from "lucide-react";
-import { loadChatSessions, loadChatContacts, ChatSession, createOrGetSession, createGroupSession, pushChatMessage, addChatContact, loadChatMessages, getLastVisibleSessionMessage, getChatMessagePreview } from "@/lib/chat-storage";
+import { loadChatSessions, loadChatContacts, ChatSession, createOrGetSession, createGroupSession, pushChatMessage, addChatContact, loadChatMessages, getLastVisibleSessionMessage, getChatMessagePreview, CHAT_UNREAD_UPDATED_EVENT } from "@/lib/chat-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { Character } from "@/lib/character-types";
 import { resolveUserIdentity } from "@/lib/settings-storage";
@@ -147,9 +147,11 @@ export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, on
         const refreshSessions = () => setSessions(loadChatSessions());
         window.addEventListener("weixin-messages-updated", refreshSessions);
         window.addEventListener("chat-messages-updated", refreshSessions);
+        window.addEventListener(CHAT_UNREAD_UPDATED_EVENT, refreshSessions);
         return () => {
             window.removeEventListener("weixin-messages-updated", refreshSessions);
             window.removeEventListener("chat-messages-updated", refreshSessions);
+            window.removeEventListener(CHAT_UNREAD_UPDATED_EVENT, refreshSessions);
         };
     }, []);
 
@@ -777,31 +779,43 @@ function SessionItem({ session, onSelect, isPinned }: { session: ChatSession, on
             className={`minimal-list-item${isPinned ? ' chat-pinned' : ''}`}
             onClick={onSelect}
         >
-            {isGroup ? (
-                <div className="minimal-avatar-wrapper grid grid-cols-2 grid-rows-2 gap-[1px] p-[2px] bg-[var(--c-card-border)] rounded-full overflow-hidden">
-                    {groupAvatarItems.map((c) => (
-                        <div key={c.id} className="overflow-hidden rounded-[3px] bg-[var(--c-page-body-bg)]">
-                            {c.avatar ? (
-                                <img src={c.avatar} className="w-full h-full object-cover pointer-events-none" alt="" />
-                            ) : (
-                                <ChatFallbackAvatar className="pointer-events-none" />
-                            )}
-                        </div>
-                    ))}
-                    {Array.from({ length: Math.max(0, 4 - groupAvatarItems.length) }).map((_, i) => (
-                        <div key={`empty-${i}`} className="overflow-hidden rounded-[3px] bg-[var(--c-page-body-bg)]" />
-                    ))}
-                </div>
-            ) : (
-                <div className="minimal-avatar-wrapper">
-                    {character?.avatar ? (
-                        <img src={character.avatar} className="w-full h-full object-cover pointer-events-none rounded-full" alt="" />
-                    ) : (
-                        <ChatFallbackAvatar className="pointer-events-none rounded-full" />
-                    )}
-                    <span className="minimal-online-dot" />
-                </div>
-            )}
+            <div className="minimal-avatar-wrapper chat-session-avatar">
+                {isGroup ? (
+                    <div className="minimal-avatar-wrapper grid grid-cols-2 grid-rows-2 gap-[1px] p-[2px] bg-[var(--c-card-border)] rounded-full overflow-hidden">
+                        {groupAvatarItems.map((c) => (
+                            <div key={c.id} className="overflow-hidden rounded-[3px] bg-[var(--c-page-body-bg)]">
+                                {c.avatar ? (
+                                    <img src={c.avatar} className="w-full h-full object-cover pointer-events-none" alt="" />
+                                ) : (
+                                    <ChatFallbackAvatar className="pointer-events-none" />
+                                )}
+                            </div>
+                        ))}
+                        {Array.from({ length: Math.max(0, 4 - groupAvatarItems.length) }).map((_, i) => (
+                            <div key={`empty-${i}`} className="overflow-hidden rounded-[3px] bg-[var(--c-page-body-bg)]" />
+                        ))}
+                    </div>
+                ) : (
+                    <div className="minimal-avatar-wrapper">
+                        {character?.avatar ? (
+                            <img src={character.avatar} className="w-full h-full object-cover pointer-events-none rounded-full" alt="" />
+                        ) : (
+                            <ChatFallbackAvatar className="pointer-events-none rounded-full" />
+                        )}
+                        <span className="minimal-online-dot" />
+                    </div>
+                )}
+                {session.unreadCount > 0 && (
+                    <span
+                        className="chat-avatar-unread-badge"
+                        role="img"
+                        aria-label={`${session.unreadCount} 条未读消息`}
+                        title={`${session.unreadCount} 条未读消息`}
+                    >
+                        {session.unreadCount}
+                    </span>
+                )}
+            </div>
             <div className="flex-1 overflow-hidden h-[48px] flex flex-col justify-center gap-1">
                 <div className="flex justify-between items-center">
                     <span className="ts-16 font-medium text-[var(--c-text-title)] truncate">

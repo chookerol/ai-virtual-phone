@@ -8,7 +8,7 @@ import { ChatRoom } from "./chat-room";
 import { MascotChatRoom } from "./mascot-chat-room";
 import { UserProfilePanel } from "./user-profile-panel";
 import { MessageCircle, Users, Aperture, UserRound } from "lucide-react";
-import { ChatSession, loadChatSessions, pushChatMessage, hydrateChatStorage } from "@/lib/chat-storage";
+import { ChatSession, loadChatSessions, pushChatMessage, hydrateChatStorage, registerChatSessionReader, markChatSessionRead } from "@/lib/chat-storage";
 import { notifyMascotPageContext } from "@/lib/mascot-events";
 import { loadCharacters } from "@/lib/character-storage";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
@@ -22,13 +22,14 @@ type TabKey = "messages" | "contacts" | "feeds" | "me";
 
 export type PhoneChatAppProps = {
     onClose: () => void;
+    isVisible?: boolean;
     initialSessionId?: string | null;
     onSessionChange?: (session: ChatSession | null) => void;
     sharePayload?: ChatSharePayload | null;
     onShareDone?: () => void;
 };
 
-export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSessionId, onSessionChange, sharePayload, onShareDone }: PhoneChatAppProps) {
+export const PhoneChatApp = memo(function PhoneChatApp({ onClose, isVisible = true, initialSessionId, onSessionChange, sharePayload, onShareDone }: PhoneChatAppProps) {
     const [activeTab, setActiveTab] = useState<TabKey>("messages");
     const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
     const [activeMascot, setActiveMascot] = useState(false);
@@ -40,6 +41,21 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
     const [visitedSessions, setVisitedSessions] = useState<Map<string, ChatSession>>(new Map());
     const [dbReady, setDbReady] = useState(false);
     const [hideTabBar, setHideTabBar] = useState(false);
+
+    // Only the selected, visible room is read; cached rooms and a closed mini window are not.
+    useEffect(() => {
+        if (!dbReady || !isVisible || !activeSession?.id) return;
+        const sessionId = activeSession.id;
+        const unregister = registerChatSessionReader(sessionId);
+        const onVisibilityChange = () => {
+            if (document.visibilityState === "visible") markChatSessionRead(sessionId);
+        };
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        return () => {
+            unregister();
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+        };
+    }, [dbReady, isVisible, activeSession?.id]);
 
     // Hydrate IndexedDB → in-memory caches on mount
     useEffect(() => {
