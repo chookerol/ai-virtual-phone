@@ -5,9 +5,9 @@
 import { Buffer } from "node:buffer";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 
-// 云函数动态核心协议版本。wrapper 只加载版本一致的桶内核心，避免站点更新后
-// 继续执行旧桶里不认识微信快捷动作续跑的代码。
-export const WEIXIN_CORE_PROTOCOL_VERSION = 3;
+// 云函数动态核心协议版本。wrapper 只加载版本一致的桶内核心，避免新部署
+// 又被旧桶代码覆盖。v4：待答轮次、过时分段与引用格式修复。
+export const WEIXIN_CORE_PROTOCOL_VERSION = 4;
 export const DEFAULT_BUCKET = "ai-phone-backup";
 export const DEFAULT_INTERVAL_SECONDS = 5;
 const INDEX_PATH = "weixin-cloud/index.json";
@@ -318,26 +318,6 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
     const replyItems = await buildLocalReplyOutbox(replyText, runtime);
     if (replyItems.length === 0) return { status: "skipped_empty_reply", pending: pending.length, sent: 0 };
 
-    let deferredShortcut = null;
-    if (shortcutRequest.action) {
-      try {
-        // 先创建命令并（如需结果）挂稳续跑，但暂不发运行通知。首条微信
-        // 回复真正送达并写入云消息后，下面才会调用 shortcut-deliver。
-        deferredShortcut = await prepareWeixinShortcut(
-          env,
-          runtime,
-          shortcutRequest.action,
-          generation.messages,
-          replyText,
-          shortcutRequest.args,
-        );
-      } catch (err) {
-        console.warn(`[weixin-assistant] 快捷动作准备失败 bot=${runtime.bot.id}: ${errorMessage(err)}`);
-      }
-    } else if (shortcutRequest.requestedName) {
-      console.warn(`[weixin-assistant] 快捷动作不存在 bot=${runtime.bot.id}: ${shortcutRequest.requestedName}`);
-    }
-
     const replyExternalId = `reply_${Date.now()}_raw_${Math.random().toString(36).slice(2)}`;
     // 首条送达后立刻把待回复消息标记为已回复：媒体回复耗时长，若函数在
     // 中途被平台掐断，下一轮不会把整段回复重新生成再发一遍（宁可丢
@@ -359,23 +339,62 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
 
     const sendResults = [];
     const sendErrors = [];
+    const sentItems = [];
+    let interrupted = false;
     for (let i = 0; i < replyItems.length; i += 1) {
       if (i > 0) await sleep(600);
+      // 只读几百字节的标志，不逐段重扫整个聊天目录。生成/发分段时若另一个
+      // 轮询已收到了新输入，本轮草稿就已过时；未发的部分不要再排队轰炸用户。
+      // 旧标志指向的消息必须确认仍待回复，避免旧版本残留标志让机器人永远停住。
+      if (await hasUncoveredPendingMessage(env, runtime.bot.id, pending)) {
+        interrupted = true;
+        break;
+      }
       try {
         const item = replyItems[i];
         const sendResult = await sendLocalReplyItem(runtime.bot?.botToken, latest.raw, item);
+        for (const field of ["ret", "error_code"]) {
+          if (sendResult?.[field] != null && Number(sendResult[field]) !== 0) {
+            throw new Error(`iLink ${field} ${sendResult[field]}`);
+          }
+        }
         sendResults.push(sendResult);
+        sentItems.push(item);
         if (sendResults.length === 1) await markPendingReplied();
       } catch (err) {
         sendErrors.push(`第${i + 1}条发送失败: ${errorMessage(err)}`);
       }
     }
 
-    if (sendResults.length === 0) throw new Error(sendErrors[0] || "send_weixin_reply_failed");
+    if (sendResults.length === 0) {
+      // 尚未发出就被新输入取代：不标记已回复、不记录草稿、不执行快捷动作。
+      // 新旧输入均留给下一轮统一回答，pending 标志也保持原样。
+      if (interrupted) return { status: "superseded", pending: pending.length, sent: 0 };
+      throw new Error(sendErrors[0] || "send_weixin_reply_failed");
+    }
 
-    await storeOutgoingMessage(env, runtime, replyExternalId, replyText, {
+    const completeReply = !interrupted && sendErrors.length === 0;
+    const storedReplyText = completeReply ? replyText : sentItems.map(replyItemHistoryText).filter(Boolean).join("\n\n");
+    let deferredShortcut = null;
+    // 草稿被打断或只发出一部分时，绝不执行草稿里的动作。通知仍要等到
+    // 命令/续跑挂稳且首轮历史落盘之后才发，避免产生看不见的过时任务。
+    if (completeReply && shortcutRequest.action && !await hasUncoveredPendingMessage(env, runtime.bot.id, pending)) {
+      try {
+        deferredShortcut = await prepareWeixinShortcut(
+          env, runtime, shortcutRequest.action, generation.messages, replyText, shortcutRequest.args,
+        );
+      } catch (err) {
+        console.warn(`[weixin-assistant] 快捷动作准备失败 bot=${runtime.bot.id}: ${errorMessage(err)}`);
+      }
+    } else if (shortcutRequest.requestedName && !shortcutRequest.action) {
+      console.warn(`[weixin-assistant] 快捷动作不存在 bot=${runtime.bot.id}: ${shortcutRequest.requestedName}`);
+    }
+
+    await storeOutgoingMessage(env, runtime, replyExternalId, storedReplyText, {
       sentCount: sendResults.length,
       failedCount: sendErrors.length,
+      interrupted,
+      replyToExternalIds: pending.map(item => item.message.externalId),
       sendResults,
       ...(deferredShortcut ? { shortcutCommandId: deferredShortcut.commandId } : {}),
     }, undefined, deferredShortcut && shortcutRequest.marker
@@ -391,7 +410,7 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
     await clearPendingFlagIfCovered(env, runtime.bot.id, pending);
 
     return {
-      status: sendErrors.length ? "partial_sent" : "sent",
+      status: interrupted ? "interrupted" : sendErrors.length ? "partial_sent" : "sent",
       pending: pending.length,
       sent: sendResults.length,
       failed: sendErrors.length,
@@ -403,6 +422,21 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
   } finally {
     await releaseAutoReplyLock(env, lock);
   }
+}
+
+function replyItemHistoryText(item) {
+  if (item.kind === "text") return String(item.text || "");
+  // 媒体只记可读协议/文字，不把 data URL 放进下一轮提示词。
+  return String(item.label || item.transcript || (item.kind === "voice" ? "[已发送语音]" : "[已发送图片]"));
+}
+
+async function hasUncoveredPendingMessage(env, botId, repliedItems) {
+  const current = await loadPendingFlag(env, botId);
+  const id = String(current?.lastInboundExternalId || "");
+  if (current?.pending !== true || !id || repliedItems.some(item => String(item.message.externalId) === id)) return false;
+  const path = `${MESSAGE_PREFIX}/${sanitizePathPart(botId)}/${sanitizePathPart(id)}.json`;
+  const message = await getObjectJson(env, path).catch(() => null);
+  return message?.direction === "inbound" && message.needsReply === true && !message.repliedAt;
 }
 
 async function acquireAutoReplyLock(env, botId) {
@@ -908,6 +942,7 @@ export function buildRuntimePromptMessages(runtime, cloudHistory, pendingMessage
 
   const collected = [];
   const seenExternalIds = new Set();
+  const pendingIds = new Set(pendingMessages.map(message => message?.externalId).filter(Boolean));
   for (const message of [...cloudHistory, ...pendingMessages]) {
     if (!message?.externalId || seenExternalIds.has(message.externalId)) continue;
     seenExternalIds.add(message.externalId);
@@ -916,6 +951,10 @@ export function buildRuntimePromptMessages(runtime, cloudHistory, pendingMessage
   }
 
   collected.sort((a, b) => {
+    // 时间顺序不等于问答轮次：B 在回答 A 期间到达时，旧答案的落盘时间
+    // 晚于 B。必须将待答 B 从历史中移到本轮末尾，否则模型会以为 B 已答过。
+    const pendingOrder = Number(pendingIds.has(a._externalId)) - Number(pendingIds.has(b._externalId));
+    if (pendingOrder) return pendingOrder;
     const at = a._createdAt || "";
     const bt = b._createdAt || "";
     if (at !== bt) return at.localeCompare(bt);
@@ -1215,12 +1254,15 @@ export function cleanReplyText(text) {
     .trim();
 }
 
-async function buildLocalReplyOutbox(text, runtime) {
+export async function buildLocalReplyOutbox(text, runtime) {
   const out = [];
   const cleaned = cleanWeixinDisplayText(text);
   if (!cleaned) return out;
 
-  const paragraphs = splitLocalReplyText(cleaned);
+  // 微信 iLink 这条发送路径没有原生引用气泡；将内部协议降级为可读引用，
+  // 并把独占一行的引用与紧随其后的回答合在同一条，避免裸标记刷屏。
+  const quoted = cleaned.replace(/\[引用\s*[：:]\s*([^\]\n]+)\]\s*/g, (_, quote) => `引用「${quote.trim()}」：`);
+  const paragraphs = splitLocalReplyText(quoted);
   for (const paragraph of paragraphs) {
     const items = await buildLocalReplyItemsFromSegment(paragraph, runtime);
     out.push(...items);

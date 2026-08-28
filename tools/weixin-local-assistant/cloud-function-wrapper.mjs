@@ -7,7 +7,8 @@ const CLOUD_CRON_SECRET_PATH = "weixin-cloud/cron-secret.json";
 const CLOUD_ASSISTANT_STATE_PATH = "weixin-cloud/state/cloud-assistant.json";
 const CLOUD_CRON_JOB_NAME = "ai-phone-weixin-assistant";
 const CLOUD_CORE_CODE_PATH = "weixin-cloud/function-core.mjs";
-const REQUIRED_BUCKET_CORE_PROTOCOL_VERSION = 3;
+// v4 包含待答轮次与过时回复修复。旧桶里的 v3 不得覆盖新部署的内置核心。
+const REQUIRED_BUCKET_CORE_PROTOCOL_VERSION = 4;
 
 // ── 自更新加载器 ──
 // 小手机同步运行包时会把最新的 assistant-core.mjs 上传到桶里；这里每次运行
@@ -285,6 +286,7 @@ Deno.serve(async (req) => {
       iterations,
       elapsedMs: Date.now() - startedAt,
       codeSource: bucketCore ? "bucket" : "bundled",
+      coreProtocolVersion: bucketCore ? bucketCore.WEIXIN_CORE_PROTOCOL_VERSION : WEIXIN_CORE_PROTOCOL_VERSION,
       bots: lastRows.map(row => ({
         botId: row.botId,
         characterId: row.characterId,
