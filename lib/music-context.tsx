@@ -7,6 +7,16 @@ import { getAudioBlob, markTrackPlayed } from "./music-storage";
 import { findPlayableMatch, getNeteaseLyrics, getNeteasePlayUrl, getNeteasePlayInfo, getNeteaseSongDetail } from "./music-service";
 import { kvGet, kvSet, registerKvMigration } from "./kv-db";
 import { registerMusicControlBridge } from "./music-control-bridge";
+import {
+    appendTogetherTrack,
+    createMusicTogetherSession,
+    finishMusicTogetherSession,
+    loadActiveMusicTogetherSession,
+    recordMusicTogetherTrackChange,
+    requestMusicTogetherFeedback,
+    saveActiveMusicTogetherSession,
+    type MusicTogetherSession,
+} from "./music-together";
 
 // ── Types ──
 
@@ -22,6 +32,8 @@ export type MusicState = {
     volume: number;
     showFullPlayer: boolean;
     floatDismissed: boolean;
+    togetherSession: MusicTogetherSession | null;
+    togetherFeedbackBusy: boolean;
 };
 
 export type MusicActions = {
@@ -41,6 +53,9 @@ export type MusicActions = {
     dismissFloat: () => void;
     openFullPlayer: () => void;
     closeFullPlayer: () => void;
+    startTogether: (characterId: string) => Promise<void>;
+    endTogether: () => Promise<void>;
+    askTogetherFeedback: () => Promise<string | null>;
 };
 
 type MusicContextValue = MusicState & MusicActions;
@@ -105,6 +120,25 @@ export function MusicProvider({ children }: { children: ReactNode }) {
     const [volume, setVolumeState] = useState(0.8);
     const [showFullPlayer, setShowFullPlayer] = useState(false);
     const [floatDismissed, setFloatDismissed] = useState(false);
+    const [togetherSession, setTogetherSession] = useState<MusicTogetherSession | null>(() => loadActiveMusicTogetherSession());
+    const [togetherFeedbackBusy, setTogetherFeedbackBusy] = useState(false);
+    const togetherSessionRef = useRef<MusicTogetherSession | null>(togetherSession);
+    const togetherFeedbackRunningRef = useRef(false);
+
+    useEffect(() => {
+        togetherSessionRef.current = togetherSession;
+    }, [togetherSession]);
+
+    // KV hydration may finish after the provider's first render. Recover an
+    // unfinished room once without disturbing a room started in the meantime.
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            if (togetherSessionRef.current) return;
+            const restored = loadActiveMusicTogetherSession();
+            if (restored) setTogetherSession(restored);
+        }, 500);
+        return () => clearTimeout(timer);
+    }, []);
 
     // Persist queue on change.
     useEffect(() => {
@@ -313,6 +347,12 @@ export function MusicProvider({ children }: { children: ReactNode }) {
         setCurrentTime(0);
         setDuration(0);
         setShowFullPlayer(false);
+        const activeTogether = togetherSessionRef.current;
+        if (activeTogether) {
+            togetherSessionRef.current = null;
+            setTogetherSession(null);
+            void finishMusicTogetherSession(activeTogether);
+        }
     }, [cleanupBlobUrl]);
 
     const removeFromQueue = useCallback((trackId: string) => {
@@ -330,6 +370,97 @@ export function MusicProvider({ children }: { children: ReactNode }) {
 
     const openFullPlayer = useCallback(() => { setFloatDismissed(false); setShowFullPlayer(true); }, []);
     const closeFullPlayer = useCallback(() => setShowFullPlayer(false), []);
+
+    const persistTogetherFeedback = useCallback((base: MusicTogetherSession, feedback: string | null) => {
+        const updated: MusicTogetherSession = {
+            ...base,
+            lastFeedbackAt: new Date().toISOString(),
+            ...(feedback ? { latestFeedback: feedback } : {}),
+        };
+        saveActiveMusicTogetherSession(updated);
+        togetherSessionRef.current = updated;
+        setTogetherSession(updated);
+    }, []);
+
+    const requestTogetherFeedback = useCallback(async (
+        base: MusicTogetherSession,
+        track: MusicTrack,
+        reason: "joined" | "track_changed" | "asked",
+    ): Promise<string | null> => {
+        if (togetherFeedbackRunningRef.current) return null;
+        togetherFeedbackRunningRef.current = true;
+        setTogetherFeedbackBusy(true);
+        try {
+            const feedback = await requestMusicTogetherFeedback(base, track, reason);
+            const latest = togetherSessionRef.current;
+            // The user may end or replace the room while the model is replying.
+            // Never let a late reply resurrect a finished room.
+            if (latest?.id === base.id) persistTogetherFeedback(latest, feedback);
+            return feedback;
+        } finally {
+            togetherFeedbackRunningRef.current = false;
+            setTogetherFeedbackBusy(false);
+        }
+    }, [persistTogetherFeedback]);
+
+    const startTogether = useCallback(async (characterId: string) => {
+        if (!currentTrack || !characterId) return;
+        const previous = togetherSessionRef.current;
+        if (previous) {
+            await finishMusicTogetherSession(previous);
+        }
+        const created = createMusicTogetherSession(characterId, currentTrack);
+        togetherSessionRef.current = created;
+        setTogetherSession(created);
+        await requestTogetherFeedback(created, currentTrack, "joined");
+    }, [currentTrack, requestTogetherFeedback]);
+
+    const endTogether = useCallback(async () => {
+        const active = togetherSessionRef.current;
+        if (!active) return;
+        togetherSessionRef.current = null;
+        setTogetherSession(null);
+        await finishMusicTogetherSession(active);
+    }, []);
+
+    const askTogetherFeedback = useCallback(async () => {
+        const active = togetherSessionRef.current;
+        if (!active || !currentTrack) return null;
+        return requestTogetherFeedback(active, currentTrack, "asked");
+    }, [currentTrack, requestTogetherFeedback]);
+
+    // Count only seconds during which the shared player is actually playing.
+    useEffect(() => {
+        if (!togetherSession || !isPlaying) return;
+        const timer = setInterval(() => {
+            setTogetherSession(previous => {
+                if (!previous) return previous;
+                const next = { ...previous, listenedSeconds: previous.listenedSeconds + 1 };
+                togetherSessionRef.current = next;
+                if (next.listenedSeconds % 10 === 0) saveActiveMusicTogetherSession(next);
+                return next;
+            });
+        }, 1000);
+        return () => clearInterval(timer);
+    }, [isPlaying, togetherSession?.id]);
+
+    // Keep the room on the same queue. Every third distinct song (with a
+    // five-minute cooldown) gives the character one natural chance to react.
+    useEffect(() => {
+        const active = togetherSessionRef.current;
+        if (!active || !currentTrack) return;
+        const updated = appendTogetherTrack(active, currentTrack);
+        if (updated === active) return;
+        togetherSessionRef.current = updated;
+        setTogetherSession(updated);
+        const lastFeedbackAt = updated.lastFeedbackAt ? Date.parse(updated.lastFeedbackAt) : Date.parse(updated.startedAt);
+        const cooldownPassed = Date.now() - lastFeedbackAt >= 5 * 60_000;
+        if (updated.tracks.length % 3 === 0 && cooldownPassed) {
+            void requestTogetherFeedback(updated, currentTrack, "track_changed");
+        } else {
+            recordMusicTogetherTrackChange(updated, currentTrack);
+        }
+    }, [currentTrack, requestTogetherFeedback]);
 
     const playResolvedTrack = useCallback(async (track: MusicTrack): Promise<{ ok: boolean; message: string; track?: MusicTrack }> => {
         setFloatDismissed(false);
@@ -448,12 +579,16 @@ export function MusicProvider({ children }: { children: ReactNode }) {
 
     const controlsValue = useMemo<MusicControlsValue>(() => ({
         currentTrack, isPlaying, duration, playMode, queue, volume, showFullPlayer, floatDismissed,
+        togetherSession, togetherFeedbackBusy,
         playTrack, playUrl, pause, resume, togglePlay, next, prev, seek,
         setPlayMode, setQueue, removeFromQueue, setVolume, stop, dismissFloat, openFullPlayer, closeFullPlayer,
+        startTogether, endTogether, askTogetherFeedback,
     }), [
         currentTrack, isPlaying, duration, playMode, queue, volume, showFullPlayer, floatDismissed,
+        togetherSession, togetherFeedbackBusy,
         playTrack, playUrl, pause, resume, togglePlay, next, prev, seek,
         setQueue, removeFromQueue, setVolume, stop, dismissFloat, openFullPlayer, closeFullPlayer,
+        startTogether, endTogether, askTogetherFeedback,
     ]);
 
     const value = useMemo<MusicContextValue>(() => ({

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, type CSSProperties } from "react";
+import { useState, useEffect, useMemo, type CSSProperties } from "react";
 import CSSSchemeBar from "@/components/ui/css-scheme-picker";
 import {
     loadFollowUpConfig,
@@ -52,6 +52,7 @@ import {
     Radio,
     RotateCcw,
     Moon,
+    MoreHorizontal,
     Satellite,
     Send,
     X,
@@ -627,10 +628,41 @@ function FollowUpSettingsEditor({ onBack }: { onBack: () => void }) {
 function ApiLogViewer({ onBack }: { onBack: () => void }) {
     const [logs, setLogs] = useState<DebugInfo[]>([]);
     const [expandedId, setExpandedId] = useState<string | null>(null);
+    // 来源过滤：hiddenSources 里记录被取消勾选的来源；空集 = 全部显示。
+    // 选择器收进右上角三点按钮打开的底部弹窗，列表区不再占一块
+    const [hiddenSources, setHiddenSources] = useState<Set<string>>(new Set());
+    const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
 
     useEffect(() => {
         setLogs([...getApiLogs()].reverse());
     }, []);
+
+    // 从日志里提取所有来源（聊天角色名 / 记忆总结·角色名 等标签）
+    const allSources = useMemo(() => {
+        const set = new Set<string>();
+        for (const log of logs) set.add(log.characterName || "未标注来源");
+        return [...set].sort();
+    }, [logs]);
+
+    const toggleSource = (source: string) => {
+        setHiddenSources(prev => {
+            const next = new Set(prev);
+            if (next.has(source)) next.delete(source); else next.add(source);
+            return next;
+        });
+    };
+
+    // 全部勾选 = 清空隐藏集；全部取消 = 隐藏所有来源
+    const allChecked = hiddenSources.size === 0;
+    const toggleAll = () => {
+        if (allChecked) setHiddenSources(new Set(allSources));
+        else setHiddenSources(new Set());
+    };
+
+    const visibleLogs = useMemo(() => {
+        if (hiddenSources.size === 0) return logs;
+        return logs.filter(log => !hiddenSources.has(log.characterName || "未标注来源"));
+    }, [logs, hiddenSources]);
 
     const handleClear = () => {
         clearApiLogs();
@@ -643,7 +675,22 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
     };
 
     return (
-        <PageShell title="后台记录" onBack={onBack} className="absolute inset-0 z-[100]">
+        <PageShell
+            title="后台记录"
+            onBack={onBack}
+            className="absolute inset-0 z-[100]"
+            rightAction={logs.length > 0 ? (
+                <button
+                    type="button"
+                    className="page-back-btn"
+                    onClick={() => setSourcePickerOpen(true)}
+                    title="来源过滤"
+                    aria-label="来源过滤"
+                >
+                    <MoreHorizontal size={22} strokeWidth={1.5} />
+                </button>
+            ) : undefined}
+        >
             <div className="page-menu">
                 {logs.length === 0 ? (
                     <div className="ui-empty">
@@ -651,8 +698,52 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                     </div>
                 ) : (
                     <>
+                        {/* 来源过滤：右上角三点打开的底部弹窗，样式同记忆库的「记忆来源」 */}
+                        {sourcePickerOpen ? (
+                            <div className="modal-overlay modal-overlay-bottom" data-ui="modal" onClick={() => setSourcePickerOpen(false)}>
+                                <div className="modal-sheet memory-source-sheet" data-ui="modal-sheet" onClick={event => event.stopPropagation()}>
+                                    <div className="modal-header" data-ui="modal-header">
+                                        <button
+                                            type="button"
+                                            className="ui-bare-btn ts-12 font-semibold text-[var(--c-icon-active)]"
+                                            onClick={toggleAll}
+                                        >
+                                            {allChecked ? "全不选" : "全选"}
+                                        </button>
+                                        <h3 className="modal-title">来源过滤</h3>
+                                        <button className="modal-header-btn modal-header-btn-muted" onClick={() => setSourcePickerOpen(false)}><X size={18} /></button>
+                                    </div>
+                                    <div className="modal-body modal-body-tight" data-ui="modal-body">
+                                        <div className="memory-source-chips" style={{ "--chip-accent": "var(--c-icon-active)" } as CSSProperties}>
+                                            {allSources.map(src => {
+                                                const isChecked = !hiddenSources.has(src);
+                                                return (
+                                                    <button
+                                                        key={src}
+                                                        type="button"
+                                                        className="memory-source-chip"
+                                                        data-off={isChecked ? undefined : ""}
+                                                        aria-pressed={isChecked}
+                                                        title={src}
+                                                        onClick={() => toggleSource(src)}
+                                                    >
+                                                        {src}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : null}
+
+                        {visibleLogs.length === 0 ? (
+                            <div className="ui-empty">
+                                <span className="menu-desc">当前来源过滤下没有调用记录</span>
+                            </div>
+                        ) : (
                         <div className="flex flex-col gap-3">
-                            {logs.map(log => {
+                            {visibleLogs.map(log => {
                                 const isOpen = expandedId === log.id;
                                 return (
                                     <div key={log.id} className="menu-group">
@@ -708,9 +799,17 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                                                         </div>
                                                     </div>
                                                 ))}
-                                                <div className="font-bold mt-3 mb-[6px] text-[var(--c-danger)]">
-                                                    AI 原始回复
-                                                </div>
+                                                {log.reasoning && (
+                                                    <>
+                                                        <div className="font-bold px-1 pt-3 pb-2 text-[var(--c-warning)]">
+                                                            思维链（Reasoning）
+                                                        </div>
+                                                        <div className="api-log-reasoning whitespace-pre-wrap break-all leading-[1.4]">
+                                                            {log.reasoning}
+                                                        </div>
+                                                    </>
+                                                )}
+                                                <div className="font-bold mt-3 mb-[6px] text-[var(--c-danger)]">AI 原始回复</div>
                                                 <div className="api-log-response whitespace-pre-wrap break-all leading-[1.4]">
                                                     {log.rawResponse}
                                                 </div>
@@ -720,6 +819,7 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                                 );
                             })}
                         </div>
+                        )}
 
                         {/* Clear button */}
                         <div className="menu-group mt-4">

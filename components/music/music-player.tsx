@@ -17,6 +17,8 @@ import {
 import MusicCommentsPage from "./music-comments";
 import MusicArtistPage from "./music-artist";
 import { loadMusicBg, playerBgStyle, MUSIC_BG_EVENT, type MusicBgConfig } from "@/lib/music-bg";
+import { loadCharacters } from "@/lib/character-storage";
+import { resolveUserIdentity } from "@/lib/settings-storage";
 
 const PLAY_MODE_ICONS: Record<PlayMode, { svg: string; label: string }> = {
     sequence: {
@@ -71,6 +73,16 @@ export default function MusicPlayer() {
     const [palette, setPalette] = useState<CoverPalette>(DEFAULT_COVER_PALETTE);
     const [bgCfg, setBgCfg] = useState<MusicBgConfig>(() => loadMusicBg());
     const [commentTotal, setCommentTotal] = useState(0);
+    const [showTogetherPicker, setShowTogetherPicker] = useState(false);
+    const characters = useMemo(() => loadCharacters(), []);
+    const togetherCharacter = useMemo(
+        () => characters.find(character => character.id === player.togetherSession?.characterId) ?? null,
+        [characters, player.togetherSession?.characterId],
+    );
+    const togetherUser = useMemo(
+        () => resolveUserIdentity(player.togetherSession?.characterId, "music"),
+        [player.togetherSession?.characterId],
+    );
 
     useEffect(() => {
         const handleBgChange = () => setBgCfg(loadMusicBg());
@@ -107,6 +119,15 @@ export default function MusicPlayer() {
         const m = Math.floor(s / 60);
         const sec = Math.floor(s % 60);
         return `${m}:${sec.toString().padStart(2, "0")}`;
+    };
+
+    const formatTogetherTime = (seconds: number) => {
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+        return h > 0
+            ? `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`
+            : `${m}:${s.toString().padStart(2, "0")}`;
     };
 
     const clearMusicToast = useCallback(() => {
@@ -223,6 +244,17 @@ export default function MusicPlayer() {
             return next;
         });
     }, [showMusicToast]);
+
+    const handleStartTogether = useCallback((characterId: string) => {
+        setShowTogetherPicker(false);
+        void player.startTogether(characterId);
+    }, [player]);
+
+    const handleEndTogether = useCallback(async () => {
+        const seconds = player.togetherSession?.listenedSeconds ?? 0;
+        await player.endTogether();
+        showMusicToast(seconds >= 60 ? "一起听已结束，这段时光已写入记忆" : "一起听已结束");
+    }, [player, showMusicToast]);
 
     // ── Parse LRC lyrics ──
     const parsedLyrics = useRef<{ time: number; text: string }[]>([]);
@@ -479,6 +511,45 @@ export default function MusicPlayer() {
                 </div>
             </div>
 
+            {player.togetherSession && togetherCharacter ? (
+                <section className="mp-together-room" aria-label={`正在与${togetherCharacter.name}一起听`}>
+                    <div className="mp-together-pair">
+                        <div className="mp-together-person">
+                            <div className="mp-together-avatar">
+                                {togetherUser?.avatarUrl ? <img src={togetherUser.avatarUrl} alt="" /> : <span>{(togetherUser?.name || "我").slice(0, 1)}</span>}
+                            </div>
+                            <span>{togetherUser?.name || "我"}</span>
+                        </div>
+                        <div className="mp-together-link" aria-hidden="true">
+                            <i /><i /><i /><i /><i />
+                            <b>LIVE</b>
+                        </div>
+                        <div className="mp-together-person">
+                            <div className="mp-together-avatar" data-character="">
+                                {togetherCharacter.avatar ? <img src={togetherCharacter.avatar} alt="" /> : <span>{togetherCharacter.name.slice(0, 1)}</span>}
+                            </div>
+                            <span>{togetherCharacter.name}</span>
+                        </div>
+                    </div>
+                    <div className="mp-together-meta">
+                        <span>一起听了 {formatTogetherTime(player.togetherSession.listenedSeconds)}</span>
+                        <button
+                            type="button"
+                            onClick={() => void player.askTogetherFeedback()}
+                            disabled={player.togetherFeedbackBusy}
+                        >
+                            {player.togetherFeedbackBusy ? "正在听…" : "听听 TA 的感受"}
+                        </button>
+                    </div>
+                    {player.togetherSession.latestFeedback ? (
+                        <div className="mp-together-feedback">
+                            <span>{togetherCharacter.name}</span>
+                            {player.togetherSession.latestFeedback}
+                        </div>
+                    ) : null}
+                </section>
+            ) : null}
+
             {/* Body — cover / vinyl / glow lyrics */}
             <div className="mp-body">
                 {view === "lyrics" ? (
@@ -618,6 +689,17 @@ export default function MusicPlayer() {
 
             {/* Social row: like / comments / share */}
             <div className="mp-social">
+                <button
+                    className="mp-social-btn mp-together-btn"
+                    {...(player.togetherSession ? { "data-active": "" } : {})}
+                    onClick={() => player.togetherSession ? void handleEndTogether() : setShowTogetherPicker(true)}
+                >
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <path d="M8.5 8.5a4 4 0 1 0 0 7M15.5 8.5a4 4 0 1 1 0 7" />
+                        <path d="M9 12h6" /><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+                    </svg>
+                    <span>{player.togetherSession ? "结束一起听" : "一起听"}</span>
+                </button>
                 <button className="mp-social-btn" {...(liked ? { "data-liked": "" } : {})} onClick={handleLike}>
                     {liked ? (
                         <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" stroke="none">
@@ -650,6 +732,33 @@ export default function MusicPlayer() {
                     <span>分享</span>
                 </button>
             </div>
+
+            {showTogetherPicker && (
+                <div className="mp-together-picker-mask" onClick={() => setShowTogetherPicker(false)}>
+                    <div className="mp-together-picker" onClick={event => event.stopPropagation()}>
+                        <div className="mp-together-picker-head">
+                            <div>
+                                <b>邀请谁一起听？</b>
+                                <span>TA 会听见同一首歌，也会记住这段时间</span>
+                            </div>
+                            <button type="button" onClick={() => setShowTogetherPicker(false)} aria-label="关闭">×</button>
+                        </div>
+                        <div className="mp-together-picker-list">
+                            {characters.length > 0 ? characters.map(character => (
+                                <button key={character.id} type="button" onClick={() => handleStartTogether(character.id)}>
+                                    <span className="mp-together-picker-avatar">
+                                        {character.avatar ? <img src={character.avatar} alt="" /> : character.name.slice(0, 1)}
+                                    </span>
+                                    <span className="mp-together-picker-name">{character.name}</span>
+                                    <span className="mp-together-picker-invite">邀请</span>
+                                </button>
+                            )) : (
+                                <div className="mp-together-picker-empty">先创建一个角色，再邀请 TA 一起听。</div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Queue drawer */}
             {showQueue && (
