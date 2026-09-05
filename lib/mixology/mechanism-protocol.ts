@@ -8,7 +8,7 @@
 // 这里只放两件事：递进去的数据包长什么样、还回来的东西怎么验。
 // 都是纯函数，可以脱离浏览器单测——这段错了不会报错，只会让机括默默改坏别人的对局。
 
-import type { MixState, MixStateValue } from "./types";
+import type { MixSectionTitleKey, MixState, MixStateValue } from "./types";
 
 /** 钩子点：流水线上开的四个口子（第五个「上桌时」属于常驻界面，不走这条通道） */
 export type MixHook = "sessionStart" | "beforeSend" | "afterReply" | "sessionEnd";
@@ -53,29 +53,43 @@ export type MixHookPayload = {
 };
 
 /** 沙盒还回来的东西 */
+/**
+ * 挂进系统提示词的一段：at 指定挂在哪个分段之后，text 原样接上（标题自带，
+ * 写 # 就是独立一段，写 ## 就读作那一段的小节）。只在这一轮的提示词里存在，不落库。
+ */
+export type MixHookSection = {
+    at: MixSectionTitleKey;
+    text: string;
+};
+
 export type MixHookResult = {
     /** 改写 text（落杯前改玩家这句，出杯后改模型正文） */
     text?: string;
-    /** 追加一段只在这一轮生效的临时提示 */
+    /** 追加一段只在这一轮生效的临时提示（挂在最末尾那条 user 消息） */
     note?: string;
+    /** 挂进系统提示词指定分段之后的内容（落杯前钩子有效） */
+    sections?: MixHookSection[];
     /** 要写进对局的记住值 */
     state?: MixState;
     /** 覆盖这件机括自己的存储 */
     store?: MixMechanismStore;
 };
 
-/** 单条文本上限：防止机括往正文里灌一大坨把上下文撑爆 */
-const MAX_TEXT = 20_000;
-const MAX_NOTE = 2_000;
-/** 存储桶上限：键数与总字节 */
-const MAX_STORE_KEYS = 100;
-const MAX_STORE_BYTES = 100_000;
-/** 一次能写多少个记住值 */
+/** 可挂的分段键：与序言自定义标题的那一套一致 */
+export const MIX_HOOK_SECTION_KEYS: readonly MixSectionTitleKey[] = [
+    "base", "character", "persona", "world", "flavor", "glass", "ticket", "encore", "examples", "checklist",
+];
+
+// text / note / store 不设长度上限，也绝不静默裁剪——被截在半句话上的记忆、
+// 悄悄丢掉的存储键，出了问题根本查不到原因，比撑大上下文更伤人。
+// 内容多大是机括作者自己的责任（记忆类机括本来就要全量喂回模型）。
+/** 一次能写多少个记住值（记住值是状态栏用的短文本，仍保留形状契约） */
 const MAX_STATE_KEYS = 50;
 const MAX_STATE_VALUE = 200;
 
-function cleanText(value: unknown, max: number): string {
-    return String(value ?? "").replace(/\u0000/g, "").slice(0, max);
+function cleanText(value: unknown, max?: number): string {
+    const text = String(value ?? "").replace(/\u0000/g, "");
+    return max ? text.slice(0, max) : text;
 }
 
 /** 记住的值只收数字与短文本，其余（对象、数组、函数残留）一律丢掉 */
@@ -91,15 +105,11 @@ function normalizeStateValue(value: unknown): MixStateValue | undefined {
 export function normalizeMechanismStore(value: unknown): MixMechanismStore {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const out: MixMechanismStore = {};
-    let bytes = 0;
     for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
-        if (Object.keys(out).length >= MAX_STORE_KEYS) break;
-        const key = cleanText(rawKey, 80).trim();
+        const key = cleanText(rawKey).trim();
         if (!key) continue;
         // 值统一存成字符串：机括想存结构自己 JSON.stringify，省得在边界上猜类型
-        const text = typeof rawValue === "string" ? cleanText(rawValue, MAX_STORE_BYTES) : cleanText(JSON.stringify(rawValue ?? null), MAX_STORE_BYTES);
-        bytes += key.length + text.length;
-        if (bytes > MAX_STORE_BYTES) break;
+        const text = typeof rawValue === "string" ? cleanText(rawValue) : cleanText(JSON.stringify(rawValue ?? null));
         out[key] = text;
     }
     return out;
@@ -114,9 +124,9 @@ export function normalizeHookResult(value: unknown): MixHookResult {
     const record = value as Record<string, unknown>;
     const out: MixHookResult = {};
 
-    if (typeof record.text === "string") out.text = cleanText(record.text, MAX_TEXT);
+    if (typeof record.text === "string") out.text = cleanText(record.text);
     if (typeof record.note === "string") {
-        const note = cleanText(record.note, MAX_NOTE).trim();
+        const note = cleanText(record.note).trim();
         if (note) out.note = note;
     }
     if (record.state && typeof record.state === "object" && !Array.isArray(record.state)) {
@@ -131,6 +141,17 @@ export function normalizeHookResult(value: unknown): MixHookResult {
         if (Object.keys(state).length) out.state = state;
     }
     if (record.store !== undefined) out.store = normalizeMechanismStore(record.store);
+    if (Array.isArray(record.sections)) {
+        const sections: MixHookSection[] = [];
+        for (const item of record.sections) {
+            if (!item || typeof item !== "object") continue;
+            const { at, text } = item as Record<string, unknown>;
+            if (typeof at !== "string" || !(MIX_HOOK_SECTION_KEYS as readonly string[]).includes(at)) continue;
+            const body = typeof text === "string" ? cleanText(text).trim() : "";
+            if (body) sections.push({ at: at as MixSectionTitleKey, text: body });
+        }
+        if (sections.length) out.sections = sections;
+    }
     return out;
 }
 

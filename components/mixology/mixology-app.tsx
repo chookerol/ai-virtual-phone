@@ -6,26 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-    Archive,
-    ChevronLeft,
-    Copy,
-    Download,
-    GlassWater,
-    ImageDown,
-    Martini,
-    MoreHorizontal,
-    Pencil,
-    Play,
-    Plus,
-    RefreshCw,
-    Share2,
-    SlidersHorizontal,
-    Trash2,
-    Upload,
-    Users,
-    Wine,
-    X,
-} from "lucide-react";
+    Archive, ChevronLeft, Copy, Download, GlassWater, ImageDown, Martini, MoreHorizontal, Pencil, Play, Plug, Plus, RefreshCw, Share2, SlidersHorizontal, Trash2, Upload, Users, Wine, X } from "lucide-react";
 import {
     clearMixMaterialPublished,
     clearMixRecipePublished,
@@ -69,12 +50,13 @@ import {
 } from "@/lib/mixology/types";
 import { fetchCurrentAccount } from "@/lib/account-client";
 import { MixHallGoneError, shareHallMaterial, shareHallRecipe, updateHallMaterial, updateHallRecipe } from "@/lib/mixology/hall-client";
-import { exportMixMaterial, exportMixMaterialPng, exportMixRecipeFile, importMixRecipePack, parseMixMaterialsFromJson, parseMixMaterialsFromPng, parseMixRecipeFile } from "@/lib/mixology/transfer";
+import { exportMixMaterial, exportMixMaterialPng, exportMixRecipeFile, importMixRecipePack, mixTrustedMechanismNames, parseMixMaterialsFromJson, parseMixMaterialsFromPng, parseMixRecipeFile } from "@/lib/mixology/transfer";
 import { MixMaterialEditor } from "./mixology-editor";
 import { MixMatAutoCover, mixMatHasAutoCover } from "./mixology-preview";
 import { MixologyGame } from "./mixology-game";
 import { CommentThread, MixologyHall } from "./mixology-hall";
 import { AuthorAvatar, KindGlyph, MatCard, MaterialDetail, MixConfirm, MixTagList, SealedNote, formatMixTime } from "./mixology-shared";
+import { MixConnectorSheet } from "./connector-sheet";
 import { MixSlotEditor } from "./slot-editor";
 import { describeMixCondition } from "@/lib/mixology/state";
 
@@ -125,6 +107,8 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
     // 创作者资料：发布到酒材/配方页时的署名与头像（酒柜头部可编辑）
     const [profile, setProfile] = useState<MixProfile>(() => loadMixProfile());
     const [profileOpen, setProfileOpen] = useState(false);
+    // 连接器管理：玩家自己的外部接口配置（机括 mix.call 用），酒柜页头部打开
+    const [connectorsOpen, setConnectorsOpen] = useState(false);
     const [profileName, setProfileName] = useState("");
     const [profileAvatar, setProfileAvatar] = useState("");
     const avatarFileRef = useRef<HTMLInputElement | null>(null);
@@ -346,22 +330,35 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
                 return;
             }
             const keep = editor.initial;
-            setEditor({
-                kind: editor.kind,
-                initial: keep
-                    ? {
-                        ...picked,
-                        id: keep.id,
-                        createdAt: keep.createdAt,
-                        publishedId: keep.publishedId,
-                        publishedAt: keep.publishedAt,
-                        author: keep.author,
-                        authorAvatar: keep.authorAvatar,
-                    } as MixMaterial
-                    : picked,
-            });
-            setEditorSeq((n) => n + 1);
-            showToast(`表单已换成「${picked.name}」的内容，还没保存。`);
+            const apply = () => {
+                setEditor({
+                    kind: editor.kind,
+                    initial: keep
+                        ? {
+                            ...picked,
+                            id: keep.id,
+                            createdAt: keep.createdAt,
+                            publishedId: keep.publishedId,
+                            publishedAt: keep.publishedAt,
+                            author: keep.author,
+                            authorAvatar: keep.authorAvatar,
+                        } as MixMaterial
+                        : picked,
+                });
+                setEditorSeq((n) => n + 1);
+                showToast(`表单已换成「${picked.name}」的内容，还没保存。`);
+            };
+            // 编辑器里上传的文件带信任模式：和酒柜导入同一道明示，别让这条路绕过去
+            if (picked.kind === "mechanism" && picked.trusted === true) {
+                setConfirm({
+                    title: "这个文件是信任模式的机括",
+                    body: <>「{picked.name}」的代码<b>会直接在对局页面里运行，不进沙盒</b>：能画进正文、能联网，也能读写这台小手机上的数据。<br />只在你信任来源时载入。</>,
+                    confirmText: "我知道，载入",
+                    run: apply,
+                });
+                return;
+            }
+            apply();
         } catch (error) {
             showToast(error instanceof Error ? error.message : "读取失败");
         }
@@ -375,17 +372,45 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
                 // 配方文件（整杯打包）：配方与材料按他人作品落库——搭配可换、内容不可改、不能发布
                 const pack = parseMixRecipeFile(await file.text());
                 if (pack) {
-                    showToast(importMixRecipePack(pack));
-                    refresh();
+                    const finishPack = () => {
+                        showToast(importMixRecipePack(pack));
+                        refresh();
+                    };
+                    // 整杯打包里夹着信任模式的机括：和单件导入一样，入柜前明示
+                    const trustedInPack = mixTrustedMechanismNames(pack.materials);
+                    if (trustedInPack.length) {
+                        setConfirm({
+                            title: "这杯配方里有信任模式的机括",
+                            body: <>{trustedInPack.map((n) => `「${n}」`).join("、")}的代码<b>会直接在对局页面里运行，不进沙盒</b>：能画进正文、能联网，也能读写这台小手机上的数据。<br />只在你信任来源时导入。</>,
+                            confirmText: "我知道，导入",
+                            run: finishPack,
+                        });
+                        return;
+                    }
+                    finishPack();
                     return;
                 }
             }
             const materials = isPng
                 ? parseMixMaterialsFromPng(await file.arrayBuffer())
                 : parseMixMaterialsFromJson(await file.text());
-            materials.forEach(saveMixMaterial);
-            refresh();
-            showToast(materials.length > 1 ? `已导入 ${materials.length} 件材料。` : `「${materials[0].name}」已入柜。`);
+            const finish = () => {
+                materials.forEach(saveMixMaterial);
+                refresh();
+                showToast(materials.length > 1 ? `已导入 ${materials.length} 件材料。` : `「${materials[0].name}」已入柜。`);
+            };
+            // 文件里带信任模式的机括：入柜前明示（它不进沙盒，能碰本机数据）
+            const trustedOnes = mixTrustedMechanismNames(materials);
+            if (trustedOnes.length) {
+                setConfirm({
+                    title: "文件里有信任模式的机括",
+                    body: <>{trustedOnes.map((n) => `「${n}」`).join("、")}的代码<b>会直接在对局页面里运行，不进沙盒</b>：能画进正文、能联网，也能读写这台小手机上的数据。<br />只在你信任来源时导入。</>,
+                    confirmText: "我知道，导入",
+                    run: finish,
+                });
+                return;
+            }
+            finish();
         } catch (error) {
             showToast(error instanceof Error ? error.message : "导入失败");
         }
@@ -592,6 +617,7 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
                             <span className="mix-profile-name">{profile.name || "起个笔名"}</span>
                             <Pencil size={12} />
                         </button>
+                        <button type="button" className="mix-icon-btn" onClick={() => setConnectorsOpen(true)} aria-label="连接器" title="连接器：给机括用的外部接口"><Plug size={17} /></button>
                         <button type="button" className="mix-icon-btn" onClick={() => importFileRef.current?.click()} aria-label="导入材料" title="从文件导入"><Upload size={17} /></button>
                     </>
                 ) : null}
@@ -978,6 +1004,37 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
                                     </button>
                                 </>
                             ) : null}
+                            {/* 官方件不可改：想改就复制一份自建的——进酒柜、直接打开编辑器 */}
+                            {isMixBuiltinId(detail.id) ? (
+                                <button
+                                    type="button"
+                                    className="mix-icon-btn"
+                                    onClick={() => {
+                                        const now = Date.now();
+                                        const copy = {
+                                            ...detail,
+                                            id: createMixId("mixmat"),
+                                            name: `${detail.name.replace(/^官方\s*·\s*/, "")} 副本`,
+                                            author: undefined,
+                                            tags: (detail.tags ?? []).filter((t) => t !== "官方"),
+                                            publishedId: undefined,
+                                            publishedAt: undefined,
+                                            imported: undefined,
+                                            createdAt: now,
+                                            updatedAt: now,
+                                        } as MixMaterial;
+                                        saveMixMaterial(copy);
+                                        refresh();
+                                        setDetail(null);
+                                        setEditor({ kind: copy.kind, initial: copy });
+                                        showToast(`已复制为自建材料「${copy.name}」，可以随意改了。`);
+                                    }}
+                                    aria-label="复制为自建"
+                                    title="复制为自建：得到一份可编辑的副本"
+                                >
+                                    <Copy size={16} />
+                                </button>
+                            ) : null}
                             {!isMixBuiltinId(detail.id) && !detail.imported ? (
                                 <>
                                     <button
@@ -1067,6 +1124,7 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
             ) : null}
 
             {/* 创作者资料编辑 */}
+            {connectorsOpen ? <MixConnectorSheet onClose={() => setConnectorsOpen(false)} onToast={showToast} /> : null}
             {profileOpen ? (
                 <div className="mix-sheet-mask" onClick={() => setProfileOpen(false)}>
                     <div className="mix-sheet" onClick={(e) => e.stopPropagation()}>
@@ -1243,13 +1301,26 @@ export function MixologyApp({ onClose }: { onClose: () => void }) {
                                             preview={mixMatHasAutoCover(material) ? <MixMatAutoCover material={material} /> : undefined}
                                             badge={isMixBuiltinId(material.id) ? "官方" : undefined}
                                             onClick={() => {
-                                                setBarSlots((prev) => {
-                                                    const current = mixSlotEntries(prev, slotPicker);
-                                                    // 已经在这一格里就不重复加
-                                                    if (current.some((e) => e.materialId === material.id)) return prev;
-                                                    return { ...prev, [slotPicker]: [...current, { materialId: material.id }] };
-                                                });
-                                                setSlotPicker(null);
+                                                const add = () => {
+                                                    setBarSlots((prev) => {
+                                                        const current = mixSlotEntries(prev, slotPicker);
+                                                        // 已经在这一格里就不重复加
+                                                        if (current.some((e) => e.materialId === material.id)) return prev;
+                                                        return { ...prev, [slotPicker]: [...current, { materialId: material.id }] };
+                                                    });
+                                                    setSlotPicker(null);
+                                                };
+                                                // 信任模式的机括不进沙盒：装进配方前让人知道自己在装什么（与插件安装同一规矩）
+                                                if (material.kind === "mechanism" && material.trusted) {
+                                                    setConfirm({
+                                                        title: "这件机括是信任模式",
+                                                        body: <>「{material.name}」的代码<b>直接在对局页面里运行，不进沙盒</b>：它能画进正文、能自己联网，也能读写这台小手机上的数据。<br />只在你信任作者、清楚它做了什么时装入。</>,
+                                                        confirmText: "我知道，装入",
+                                                        run: add,
+                                                    });
+                                                    return;
+                                                }
+                                                add();
                                             }}
                                             key={material.id}
                                         />

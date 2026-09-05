@@ -8,7 +8,8 @@ import { ChatEngineError, sendLLMRequest, sendLLMStreamRequest } from "../chat-e
 import type { LLMMessage } from "../llm-prompt-assembler";
 import { loadApiConfigs, loadBindingConfig } from "../settings-storage";
 import type { ApiConfig } from "../settings-types";
-import { applyMixMacros, assembleMixPrompt, MIX_DEFAULT_USER_NAME, MIX_ENCORE_CLOSE, MIX_ENCORE_OPEN, MIX_TICKET_CLOSE, MIX_TICKET_OPEN, mixNamedOpen, type MixAssembledPrompt } from "./assembler";
+import type { MixHookSection } from "./mechanism-protocol";
+import { assembleMixPrompt, MIX_DEFAULT_USER_NAME, MIX_ENCORE_CLOSE, MIX_ENCORE_OPEN, MIX_TICKET_CLOSE, MIX_TICKET_OPEN, mixNamedOpen, type MixAssembledPrompt } from "./assembler";
 import { applyMixFilterRules, extractMixBlocks, type MixExtractedBlock } from "./prose";
 import {
     getMixMaterial,
@@ -44,21 +45,10 @@ import {
 } from "./state";
 import { mergeHookState, type MixHook, type MixHookPayload } from "./mechanism-protocol";
 import { disposeMixSandboxes, runMixHook } from "./mechanism-runtime";
+import { disposeMixTrusted, runMixTrustedHook } from "./trusted-runtime";
 
 export const MIX_PROMPT_APP_ID = "mixology";
 const MIX_PROMPT_TAGS = ["mixology"];
-
-/**
- * 状态栏补写进行中的广播：补写是一次额外的模型往返，流式已经结束、
- * 界面上没有任何东西在动，不喊一声用户会以为卡死。对局页听这个事件挂 toast。
- */
-export const MIX_REPAIR_EVENT = "mixology-ticket-repair";
-export type MixRepairEventDetail = { sessionId: string; name?: string; done?: boolean };
-
-function emitMixRepair(detail: MixRepairEventDetail): void {
-    if (typeof window === "undefined") return;
-    window.dispatchEvent(new CustomEvent(MIX_REPAIR_EVENT, { detail }));
-}
 
 /** 对局用的 API 配置：全局默认接口 */
 export function resolveMixApiConfig(): ApiConfig | null {
@@ -73,7 +63,7 @@ export function resolveMixApiConfig(): ApiConfig | null {
 }
 
 /** 从方案快照装配提示词（材料从酒柜按 id 现取；角色卡被删则报错） */
-function assembleFromSession(session: MixSession): {
+function assembleFromSession(session: MixSession, sections?: MixHookSection[]): {
     prompt: MixAssembledPrompt;
     /** 本轮生效的小票/尾调（条件筛过、按槽位顺序）——每件各自成块 */
     tickets: MixTicketMaterial[];
@@ -92,6 +82,7 @@ function assembleFromSession(session: MixSession): {
         userName: session.userName,
         openingIndex: session.openingIndex,
         state: session.state,
+        sections,
     });
     const tickets = (active.ticket ?? []).filter((m): m is MixTicketMaterial => m.kind === "ticket");
     const encores = (active.encore ?? []).filter((m): m is MixEncoreMaterial => m.kind === "encore");
@@ -296,65 +287,13 @@ export async function runMixSessionEnd(sessionId: string): Promise<void> {
         }
     }
     disposeMixSandboxes(sessionId);
+    disposeMixTrusted(sessionId);
 }
 
 export type MixReplyResult = {
     session: MixSession;
     turn: MixTurn;
 };
-
-/**
- * 状态栏补写：不少模型（实测 DeepSeek）在长篇角色扮演里经常把回复末尾的
- * 状态栏块整个漏掉，提示词层面救不稳。漏块时用一次小请求单独把状态栏要
- * 回来——而且补出的块会随历史回放形成先例，后续轮次的自发服从率会明显上升。
- */
-async function repairMixTicket(
-    apiConfig: ApiConfig,
-    session: MixSession,
-    ticket: MixTicketMaterial,
-    proseText: string,
-    signal?: AbortSignal,
-): Promise<string | undefined> {
-    const charName = session.charName;
-    const userName = session.userName || "你";
-    const contract = applyMixMacros(ticket.contract.trim(), charName, userName);
-    if (!contract) return undefined;
-    const lastUser = [...session.turns].reverse().find((t) => t.role === "user")?.text ?? "";
-    const messages: LLMMessage[] = [
-        {
-            role: "system",
-            content: [
-                `你在为一场角色扮演对局补写状态栏，角色是${charName}。根据本轮正文，按「输出内容」的要求逐行填写本轮的实际数据。只输出状态栏块本身，不要输出任何其他内容。`,
-                "输出内容：",
-                contract,
-                `输出格式：第一行 ${MIX_TICKET_OPEN}，随后逐行填写，最后一行 ${MIX_TICKET_CLOSE}。`,
-            ].join("\n"),
-            _debugMeta: { marker: "mixology_ticket_repair" },
-        },
-        {
-            role: "user",
-            content: `${lastUser ? `本轮${userName}的发言：\n${lastUser}\n\n` : ""}本轮${charName}的正文：\n${proseText}`,
-        },
-    ];
-    try {
-        const raw = await sendLLMRequest(
-            apiConfig,
-            null,
-            messages,
-            [],
-            { characterName: charName, userName },
-            { appId: MIX_PROMPT_APP_ID, appTags: MIX_PROMPT_TAGS, skipOutputRegex: true, signal },
-        );
-        const { ticketRaw } = extractMixBlocks(raw);
-        if (ticketRaw) return ticketRaw;
-        // 有的模型只回数据不带壳：没有任何标签痕迹且长度合理时直接采用
-        const bare = raw.trim();
-        if (bare && !/[\[\]【】]/.test(bare) && bare.length < 1200) return bare;
-    } catch {
-        // 补写失败不拦主回复——顶多这一轮没有状态栏
-    }
-    return undefined;
-}
 
 /**
  * 跑一轮机括钩子。机括这一格是累加型——条件命中的几件按顺序依次跑，
@@ -366,7 +305,7 @@ async function runMechanismHooks(
     hook: MixHook,
     input: { text?: string; ticketRaws?: string[]; encoreRaws?: string[]; edited?: boolean },
     roster?: MixMechanismMaterial[],
-): Promise<{ text?: string; notes: string[]; state: MixState; store: Record<string, Record<string, string>>; roster: MixMechanismMaterial[]; wrote: string[] }> {
+): Promise<{ text?: string; notes: string[]; sections: MixHookSection[]; state: MixState; store: Record<string, Record<string, string>>; roster: MixMechanismMaterial[]; wrote: string[] }> {
     // roster：这一轮的机括名单。生效条件一轮只判一次（落杯前那次），之后
     // 由调用方原封传回来——否则小票一更新记住的值，条件在同一轮里翻脸，
     // 落杯前注入的标记行就没人回收，原样漏进正文。
@@ -378,7 +317,7 @@ async function runMechanismHooks(
     }
     const store = { ...(session.mechanismStore ?? {}) };
     // wrote：这一趟真正重新记了账的机括。调用方据此判断"谁没记"，别让它原来的账被连累
-    const out = { text: input.text, notes: [] as string[], state: {} as MixState, store, roster: mechanisms, wrote: [] as string[] };
+    const out = { text: input.text, notes: [] as string[], sections: [] as MixHookSection[], state: {} as MixState, store, roster: mechanisms, wrote: [] as string[] };
     if (!mechanisms.length) return out;
     for (const material of mechanisms) {
         const script = material.script?.trim();
@@ -399,9 +338,13 @@ async function runMechanismHooks(
             encoreRaws: input.encoreRaws,
             edited: input.edited || undefined,
         };
-        const result = await runMixHook(session.id, material.id, script, hook, payload);
+        // 信任模式的机括不进沙盒：钩子在页面里登记过的函数上跑，数据契约一样
+        const result = material.trusted
+            ? await runMixTrustedHook(session.id, material.id, hook, payload)
+            : await runMixHook(session.id, material.id, script, hook, payload);
         if (typeof result.text === "string") out.text = result.text;
         if (result.note) out.notes.push(result.note);
+        if (result.sections?.length) out.sections.push(...result.sections);
         if (result.state) out.state = mergeHookState(out.state, result.state);
         if (result.store) { store[material.id] = result.store; out.wrote.push(material.id); }
     }
@@ -409,14 +352,14 @@ async function runMechanismHooks(
 }
 
 /** 落杯前：给机括一次改写玩家发言、追加临时提示的机会。返回本轮机括名单，出杯后照单回收 */
-async function runBeforeSendHooks(session: MixSession, text?: string): Promise<{ session: MixSession; text?: string; note?: string; roster: MixMechanismMaterial[] }> {
+async function runBeforeSendHooks(session: MixSession, text?: string): Promise<{ session: MixSession; text?: string; note?: string; sections: MixHookSection[]; roster: MixMechanismMaterial[] }> {
     const result = await runMechanismHooks(session, "beforeSend", { text });
     const next: MixSession = {
         ...session,
         state: mergeHookState(session.state ?? {}, result.state),
         mechanismStore: result.store,
     };
-    return { session: next, text: result.text, note: result.notes.join("\n") || undefined, roster: result.roster };
+    return { session: next, text: result.text, note: result.notes.join("\n") || undefined, sections: result.sections, roster: result.roster };
 }
 
 /**
@@ -524,6 +467,7 @@ async function runMixGeneration(
     skipBeforeSend = false,
     onDelta?: (text: string) => void,
     roster?: MixMechanismMaterial[],
+    sections?: MixHookSection[],
 ): Promise<MixReplyResult> {
     const apiConfig = resolveMixApiConfig();
     if (!apiConfig) {
@@ -533,6 +477,8 @@ async function runMixGeneration(
     // 因为改写要发生在发言落库之前）；这些路径没有新发言，机括只能追加临时提示
     let working = session;
     let extraNote: string | undefined;
+    // 机括挂进系统提示词的段：与 note 一样只活这一轮，不落库
+    let hookSections = sections;
     // 本轮机括名单：落杯前判一次条件，出杯后照同一份名单跑回收——
     // 中途小票改了记住的值也不换人，注入过格式要求的机括必须自己收尾
     let turnRoster = roster;
@@ -540,11 +486,12 @@ async function runMixGeneration(
         const before = await runBeforeSendHooks(session);
         working = before.session;
         extraNote = before.note;
+        hookSections = before.sections;
         turnRoster = before.roster;
         if (working !== session) saveMixSession(working);
     }
     const combinedNudge = [nudge, extraNote].filter(Boolean).join("\n\n") || undefined;
-    const { prompt: assembled, tickets, encores, active } = assembleFromSession(working);
+    const { prompt: assembled, tickets, encores, active } = assembleFromSession(working, hookSections);
     const messages = buildMixMessages(working, assembled, combinedNudge, buildFeedResolver(working, tickets, encores));
     const meta = { characterName: working.charName, userName: working.userName || "你" };
     // skipTimestampStrip：特调是"所见即模型所写"，不走聊天那套幻觉时间戳剥离——
@@ -581,34 +528,7 @@ async function runMixGeneration(
     if (!text && !ticketBlocks.length) {
         throw new ChatEngineError("模型没有给出内容，请再试一次。");
     }
-    // 状态栏补写：逐张核对，漏了哪张就单独把哪张要回来。
-    // 补出的块同时并进"原始输出"存档——它算这一轮产出的一部分，不并进去的话
-    // 玩家编辑一次别的字，重跑剥离管线时这一块就凭空消失了。
-    const repairedTexts: string[] = [];
-    if (text) {
-        const missing = contractTickets.filter(
-            (ticket) => ticket.renderHtml.trim() && !ticketBlocks.some((b) => b.id === ticket.id),
-        );
-        if (missing.length) {
-            try {
-                for (const ticket of missing) {
-                    emitMixRepair({ sessionId: working.id, name: ticket.name });
-                    const repaired = await repairMixTicket(apiConfig, working, ticket, text, signal);
-                    if (repaired) {
-                        const block: MixTurnBlock = { id: ticket.id, raw: repaired };
-                        ticketBlocks.push(block);
-                        repairedTexts.push(blockText(MIX_TICKET_OPEN, MIX_TICKET_CLOSE, block, contractTickets.length > 1));
-                    }
-                }
-            } finally {
-                // 无论补成没补成都要收 toast，别让它挂在屏幕上过夜
-                emitMixRepair({ sessionId: working.id, done: true });
-            }
-        }
-    }
     ticketBlocks = orderMixBlocks(ticketBlocks, contractTickets);
-    // 原始输出存档：模型原文 + 按规范位置（回复最开头）并进去的补写块
-    const rawStored = repairedTexts.length ? [...repairedTexts, raw].join("\n\n") : raw;
     // 记住的值：用这一轮各张小票自己的块更新，抽不到的保留上一轮；顺带把结果快照在这一轮上，
     // 回溯/重说/编辑时直接取剩下最后一轮的快照还原。
     const stateFromTicket = advanceMixStateWithBlocks(working.state, contractTickets, ticketBlocks);
@@ -633,7 +553,7 @@ async function runMixGeneration(
         role: "assistant",
         text: finalText,
         // 真原文存档：机括改写/摘标记行之前的那份，「编辑原始输出」展示的就是它
-        rawText: rawStored,
+        rawText: raw,
         // 单块字段冗余存第一块：老读取路径与跨版本数据都还认得
         ticketRaw: keptTickets[0]?.raw,
         encoreRaw: keptEncores[0]?.raw,
@@ -686,7 +606,7 @@ export async function generateMixReply(
     onUserTurn?.();
     // 这条路径的落杯前已经跑过了，别在 runMixGeneration 里重复触发；
     // 名单原封带过去，出杯后照单回收
-    return runMixGeneration(withUser, before.note, signal, true, onDelta, before.roster);
+    return runMixGeneration(withUser, before.note, signal, true, onDelta, before.roster, before.sections);
 }
 
 /** 本局全部小票材料（记住的值的声明来源），按槽位顺序 */
@@ -842,6 +762,36 @@ export function truncateMixAfterTurn(sessionId: string, turnId: string): MixSess
  * 模型输出掉了格式也能手动修好重渲染；玩家发言仍是纯文本。
  * 编辑的是玩家发言时，调用方应随后用 regenerateMixTail 重新生成回复。
  */
+/**
+ * 对本局历史重跑「进上下文」滤网：把每一轮 AI 正文按当前配方里生效的规则再洗一遍。
+ * 进上下文的滤网只在回复入库那一刻洗，中途新加或改了规则，旧轮次不会回头洗——
+ * 这里补这一手。只动 text（存的和发回模型的都是它），不碰 rawText：原始输出留着，
+ * 之后再编辑看到的仍是模型的原话。规则的生效条件按"那一轮之前的历史"重建现场判。
+ * 返回洗动了几轮，好让界面说清楚发生了什么。
+ */
+export function rerunMixFilters(sessionId: string): { changed: number; total: number; rules: number } {
+    const session = getMixSession(sessionId);
+    if (!session) throw new ChatEngineError("对局不存在。");
+    const entries = resolveMixRecipeMaterials(session.recipe).entries;
+    let changed = 0;
+    let total = 0;
+    let rules = 0;
+    const turns = session.turns.map((turn, idx) => {
+        if (turn.role !== "assistant" || !turn.text) return turn;
+        total += 1;
+        const before = session.turns.slice(0, idx);
+        const active = pickActiveMixMaterials(entries, buildMixConditionContext(withRolledBackState(session, before)));
+        const filterRules = (active.filter ?? []).flatMap((m) => (m.kind === "filter" ? m.rules : []));
+        rules = Math.max(rules, filterRules.filter((r) => r.mode === "context" && r.find).length);
+        const next = applyMixFilterRules(turn.text, filterRules.length ? filterRules : undefined, "context");
+        if (next === turn.text) return turn;
+        changed += 1;
+        return { ...turn, text: next };
+    });
+    if (changed > 0) saveMixSession({ ...session, turns });
+    return { changed, total, rules };
+}
+
 export function editMixTurn(sessionId: string, turnId: string, newText: string): MixSession {
     const current = getMixSession(sessionId);
     if (!current) throw new ChatEngineError("对局不存在。");

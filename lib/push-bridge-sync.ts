@@ -325,6 +325,9 @@ async function buildScreenChatSnapshot(): Promise<Record<string, unknown> | null
             },
             // 图像识别开关跟随该角色绑定的 API 配置：开 = 服务端注入截图，关 = 代入 OCR 文字
             enableVision: config.enableImageRecognition === true,
+            // 每日上限已取消。新函数不读这个字段；还没重新部署的旧函数会把它钳到 500——
+            // 传 500 让老部署立刻从默认 120 提到它能达到的最大值，重新部署后彻底无限
+            dailyCap: 500,
             // 云端只保留尚未回端的增量；已合并轮次由该水位裁掉，避免和完整本地历史重复。
             ackSequence: loadScreenChatAck(screen.characterId),
             chat: { characterId: screen.characterId, sessionId: session.id, characterName: character.name },
@@ -341,6 +344,34 @@ async function buildScreenChatSnapshot(): Promise<Record<string, unknown> | null
         console.warn("[BridgeSync] screen chat snapshot build failed", err);
         return null;
     }
+}
+
+/**
+ * 解除旧版个人云 push-bridge 的每日回话上限：新函数已无上限，但没重新部署的
+ * 旧函数还在读 push_bridge_config.daily_cap（默认 20 且无 UI 可调）。同步链路
+ * 手里本来就有用户自己项目的 service key，直接把这一列改成够不着的大数，
+ * 老部署不用重新部署也立刻解除。宽容执行：列不存在（更老的库）或网络失败
+ * 都不致命——那类部署迟早要重装，重装后本就无上限。成功一次后不再重复。
+ */
+const BRIDGE_CAP_LIFTED_KV = "bridge_daily_cap_lifted_v1";
+
+async function liftPersonalBridgeDailyCap(cloudConfig: { url: string; key: string }): Promise<void> {
+    if (kvGet(BRIDGE_CAP_LIFTED_KV) === "done") return;
+    try {
+        const base = cloudConfig.url.replace(/\/+$/, "");
+        // 个人云的 push_bridge_config 只有拥有者一行，not.is.null 过滤只为满足语义
+        const response = await fetch(`${base}/rest/v1/push_bridge_config?user_id=not.is.null`, {
+            method: "PATCH",
+            headers: {
+                apikey: cloudConfig.key,
+                Authorization: `Bearer ${cloudConfig.key}`,
+                "Content-Type": "application/json",
+                Prefer: "return=minimal",
+            },
+            body: JSON.stringify({ daily_cap: 1_000_000_000 }),
+        });
+        if (response.ok) kvSet(BRIDGE_CAP_LIFTED_KV, "done");
+    } catch { /* 尽力而为 */ }
 }
 
 async function runSync(): Promise<void> {
@@ -428,6 +459,7 @@ async function runSync(): Promise<void> {
                 }),
             }).catch(() => null);
             if (response?.ok) kvSet(SYNC_HASH_KV, fullFingerprint);
+            void liftPersonalBridgeDailyCap(cloudConfig);
             return;
         }
 

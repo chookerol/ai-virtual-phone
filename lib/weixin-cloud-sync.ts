@@ -72,6 +72,7 @@ import { ensureBucket, getObject, listObjects, putObject, removeObject } from ".
 import type { WeixinBotConfig } from "./weixin-storage";
 import { loadWeixinBots } from "./weixin-storage";
 import { parseAIResponse } from "./rich-message-parser";
+import { getStatusRegionConfig, isCustomStatusRegionActive } from "./chat-status-region";
 
 const WEIXIN_CLOUD_CONFIG_KEY = "weixin_cloud_sync_config_v1";
 const WEIXIN_CLOUD_PREFIX = "weixin-cloud";
@@ -282,10 +283,9 @@ export type WeixinCloudMessagePullResult = {
 };
 
 // ── 同步过程可见化 ──
-// lib 层没有 UI，把同步进展/失败广播出去，desktop-shell 挂了一个全局小 toast 承载。
-// 过程常驻式：动手时先挂一条 sticky 的「…中」，结束时用同一个 id 替换成结果
-//（成功短暂停留后消失、失败久留），中途发现没事可干就无声撤下（text 传 null）。
-// 每 8 秒一轮的空转检查保持安静，否则 toast 变成噪音反而没人看。
+// lib 层没有 UI，把同步事件广播出去，desktop-shell 挂了一个全局小 toast 承载。
+// 只报失败：进度/成功提示（「同步中…」「已同步 N 条」）按用户反馈全部撤掉——
+// 同步本来就该无感，成功是常态不值得打扰；失败才需要被看见，且自带节流防刷屏。
 export const WEIXIN_SYNC_TOAST_EVENT = "weixin-cloud-sync-toast";
 const syncToastLastAt = new Map<string, number>();
 
@@ -385,6 +385,17 @@ export function buildWeixinCloudAssistantFunctionUrl(config: CloudBackupConfig =
   const base = normalizeBackupUrl(config.url);
   if (!base) throw new Error("请先在数据管理里配置 Supabase 云端备份。");
   return `${base}/functions/v1/${WEIXIN_CLOUD_FUNCTION_SLUG}`;
+}
+
+/**
+ * 换设备重连用的部署探测：微信云函数没有健康检查接口，但部署流程一定会把
+ * cron 密钥写进备份桶（见 ensureWeixinCloudCronSecret）——桶里有这个对象，
+ * 就说明该项目部署过微信接入。
+ */
+export async function probeWeixinCloudDeployed(): Promise<boolean> {
+  const config = requireCloudBackupConfig();
+  const existing = await getObject(config, WEIXIN_CLOUD_CRON_SECRET_PATH);
+  return Boolean(existing);
 }
 
 /**
@@ -1263,8 +1274,6 @@ export async function pullWeixinCloudMessagesFromCloud(
      * 兜住历史上「中间漏一段没导入」的坑。limitPerBot 只是每页大小，不是总上限。
      */
     scan?: "latest" | "full";
-    /** 发现要下载的新消息对象时回调（每个 bot 一次）：调用方据此挂「同步中」提示 */
-    onNewObjects?: (count: number) => void;
   },
 ): Promise<WeixinCloudMessagePullResult> {
   await Promise.all([hydrateChatStorage(), ensureSettingsStorageHydrated()]);
@@ -1322,7 +1331,6 @@ export async function pullWeixinCloudMessagesFromCloud(
 
     const freshObjects = objects.filter(object => object.name && !object.name.endsWith("/") && !isKnownName(object.name));
     result.skipped += objects.length - freshObjects.length;
-    if (freshObjects.length > 0) options?.onNewObjects?.(freshObjects.length);
 
     const storedMessages: WeixinCloudStoredMessage[] = [];
     for (const object of freshObjects) {
@@ -1411,27 +1419,10 @@ export function startWeixinCloudRealtimeSync(): () => void {
     const scan = deep || now - lastFullScanAt >= FULL_SCAN_INTERVAL_MS ? "full" as const : "latest" as const;
     // 保存 promise 而不只是布尔：运行包同步要能等这一轮拉取落库（见 syncRuntimesNow）。
     const running = (async () => {
-      // 过程常驻：全量扫一开始就挂提示；常规轮询安静，但一发现要下载的新消息立刻挂
-      let stickyShown = scan === "full";
-      if (stickyShown) emitWeixinSyncToast("微信消息全量检查中…", { id: "weixin-pull", sticky: true });
-      let found = 0;
       try {
-        const result = await pullWeixinCloudMessagesFromCloud({
-          limitPerBot: 200,
-          scan,
-          onNewObjects: (count) => {
-            found += count;
-            stickyShown = true;
-            emitWeixinSyncToast(`正在同步 ${found} 条微信消息…`, { id: "weixin-pull", sticky: true });
-          },
-        });
+        const result = await pullWeixinCloudMessagesFromCloud({ limitPerBot: 200, scan });
         if (scan === "full") lastFullScanAt = Date.now();
-        if (result.added > 0) {
-          dispatchPulledSessions(result.sessionIds);
-          emitWeixinSyncToast(`已同步 ${result.added} 条微信消息`, { id: "weixin-pull" });
-        } else if (stickyShown) {
-          emitWeixinSyncToast(null, { id: "weixin-pull" });
-        }
+        if (result.added > 0) dispatchPulledSessions(result.sessionIds);
         if (result.errors.length > 0) {
           console.warn("[WeixinCloudSync] pull errors:", result.errors);
           emitWeixinSyncToast(`微信消息拉取失败：${result.errors[0]}`, { id: "weixin-pull", throttleMs: 30_000, duration: 4000 });
@@ -1458,15 +1449,11 @@ export function startWeixinCloudRealtimeSync(): () => void {
     uploadInFlight = true;
     const items = Array.from(uploadQueue.values());
     uploadQueue.clear();
-    emitWeixinSyncToast(`正在上传 ${items.length} 条消息到微信云端…`, { id: "weixin-upload", sticky: true });
     try {
-      let uploaded = 0;
       for (const message of items) {
         if (deletedLocalMessageIds.has(message.id)) continue;
-        if (await syncLocalWeixinCloudMessageToCloud(message)) uploaded += 1;
+        await syncLocalWeixinCloudMessageToCloud(message);
       }
-      if (uploaded > 0) emitWeixinSyncToast(`已上传 ${uploaded} 条消息到微信云端`, { id: "weixin-upload" });
-      else emitWeixinSyncToast(null, { id: "weixin-upload" });
     } catch (err) {
       console.warn("[WeixinCloudSync] local upload failed:", err);
       emitWeixinSyncToast(`微信消息上传云端失败：${err instanceof Error ? err.message : String(err)}`, { id: "weixin-upload", throttleMs: 30_000, duration: 4000 });
@@ -1500,9 +1487,7 @@ export function startWeixinCloudRealtimeSync(): () => void {
 
     // 编辑后的分段沿用原 cloudSync，拉取侧的去重照旧命中；这里把编辑结果回写云端，
     // 否则助手下一轮从云消息目录读到的仍是编辑前的原文。
-    emitWeixinSyncToast("正在把编辑结果回写微信云端…", { id: "weixin-edit", sticky: true });
     void syncEditedWeixinCloudMessageToCloud(detail.messages, detail.rawResponseText)
-      .then(() => emitWeixinSyncToast("编辑已回写微信云端", { id: "weixin-edit" }))
       .catch((err) => {
         console.warn("[WeixinCloudSync] edited reply write-back failed:", err);
         emitWeixinSyncToast(`编辑回写微信云端失败：${err instanceof Error ? err.message : String(err)}`, { id: "weixin-edit", duration: 4000 });
@@ -1556,11 +1541,8 @@ export function startWeixinCloudRealtimeSync(): () => void {
       // 云端助手照着它回答就是丢上下文——用户看到的就是角色突然不记得刚说过的话。
       await pullInFlight;
       if (stopped) return;
-      emitWeixinSyncToast("微信运行包同步中…", { id: "weixin-runtime", sticky: true });
-      const results = await syncAllWeixinBotRuntimesToCloud();
+      await syncAllWeixinBotRuntimesToCloud();
       lastRuntimeSyncAt = Date.now();
-      if (results.length > 0) emitWeixinSyncToast("微信运行包已同步", { id: "weixin-runtime" });
-      else emitWeixinSyncToast(null, { id: "weixin-runtime" });
     } catch (err) {
       console.warn("[WeixinCloudSync] runtime auto sync failed:", err);
       emitWeixinSyncToast(`微信运行包同步失败：${err instanceof Error ? err.message : String(err)}`, { id: "weixin-runtime", throttleMs: 30_000, duration: 4000 });
@@ -1978,6 +1960,10 @@ function importCloudAssistantMessage(
     characterName,
   );
   const parsed = parseAIResponse(normalizedContent, getLatestCharacterStateValues(stored.characterId));
+  // 自定义状态栏渲染戳：不盖的话 custom 模式下 [状态栏] 原文按 markdown 渲染，看着像掉格式
+  const statusRegionMode = parsed.statusPanel && isCustomStatusRegionActive(getStatusRegionConfig(session.id))
+    ? ("custom" as const)
+    : undefined;
   const visibleParts = parsed.parts.filter(part =>
     part.mediaType !== "voice_call"
     && part.mediaType !== "video_call"
@@ -2008,6 +1994,7 @@ function importCloudAssistantMessage(
       mediaType: part.mediaType,
       mediaData: part.mediaData,
       statusPanel: index === 0 && parsed.statusPanel ? parsed.statusPanel : undefined,
+      statusRegionMode: index === 0 && parsed.statusPanel ? statusRegionMode : undefined,
       innerMonologue: index === 0 && parsed.innerMonologue ? parsed.innerMonologue : undefined,
       stateValues: index === 0 && parsed.stateValues.length > 0 ? parsed.stateValues : undefined,
       freshStateValues: index === 0 ? parsed.freshStateValues : undefined,
@@ -2019,6 +2006,7 @@ function importCloudAssistantMessage(
       role: "assistant",
       content: "",
       statusPanel: parsed.statusPanel || undefined,
+      statusRegionMode,
       innerMonologue: parsed.innerMonologue || undefined,
       stateValues: parsed.stateValues.length > 0 ? parsed.stateValues : undefined,
       freshStateValues: parsed.freshStateValues,

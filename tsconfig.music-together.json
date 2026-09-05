@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false
+  },
+  "include": [
+    "next-env.d.ts",
+    "components/music/music-player.tsx",
+    "lib/music-context.tsx",
+    "lib/music-together.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "outputs",
+    "work",
+    "supabase/functions"
+  ]
+}
