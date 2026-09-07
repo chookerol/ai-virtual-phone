@@ -262,6 +262,8 @@ function MixMechanismStage({ target }: { target: Extract<MixPreviewTarget, { kin
             charName: MECH_CHAR,
             userName: MECH_USER,
             text: hook === "beforeSend" ? MECH_SAY : hook === "afterReply" ? MECH_REPLY : undefined,
+            raw: hook === "rawReply" ? `[状态栏]\n好感度：61\n地点：吧台\n[/状态栏]\n\n${MECH_REPLY}` : undefined,
+            lastReply: hook === "beforeSend" ? MECH_REPLY : undefined,
             ticketRaw: hook === "afterReply" ? "好感度：61\n地点：吧台" : undefined,
             encoreRaw: undefined,
         };
@@ -270,6 +272,8 @@ function MixMechanismStage({ target }: { target: Extract<MixPreviewTarget, { kin
             : await runMixHook(MECH_SESSION, MECH_MATERIAL, target.script, hook, payload);
         const lines: string[] = [];
         if (typeof out.text === "string") lines.push(`正文改写\n${short(out.text, 400)}`);
+        if (typeof out.raw === "string") lines.push(`原文改写（剥块前）\n${short(out.raw, 400)}`);
+        if (typeof out.lastReply === "string") lines.push(`最近一条 assistant 改写\n${short(out.lastReply, 400)}`);
         if (out.note) lines.push(`临时提示 · ${out.note.length} 字\n${short(out.note, 600)}`);
         if (out.state) lines.push(`记住的值 · ${Object.entries(out.state).map(([k, v]) => `${k}=${v}`).join("、")}`);
         if (out.store) {
@@ -533,7 +537,7 @@ const STRUCTURE_ROWS: { section: string; from: string; kind?: string }[] = [
     { section: "# 状态栏", from: "格式说明在前，小票的「输出契约」是一个 ##，壳为 [状态栏]...[/状态栏]", kind: "ticket" },
     { section: "# 小剧场", from: "格式说明在前，尾调的「输出契约」是一个 ##，壳为 [小剧场]...[/小剧场]", kind: "encore" },
     { section: "# 示例对话", from: "角色卡：示例对话", kind: "character" },
-    { section: "# 输出格式检查", from: "系统自带的收尾核对清单（带状态栏/小剧场时出现）" },
+    { section: "# 输出格式检查", from: "核对材料（叠多件按顺序拼）；没装则没有这一段（官方出厂件在槽位候选里可选）", kind: "checklist" },
 ];
 
 export function MixStructureSheet({ highlight, onClose }: { highlight?: string; onClose: () => void }) {

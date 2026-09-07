@@ -17,6 +17,7 @@ import type {
 } from "@/lib/mixology/types";
 import { createMixId, formatMixTags, MIX_KIND_LABELS, MIX_PANEL_DEFAULT_LAYOUT, MIX_SECTION_TITLE_DEFAULTS, MIX_TAG_MAX, mixPanelLayoutOf, normalizeMixConnectorNames, normalizeMixDialogueButton, parseMixTags, type MixSectionTitleKey } from "@/lib/mixology/types";
 import { applyMixFilterRules } from "@/lib/mixology/prose";
+import { createBuiltinChecklist } from "@/lib/mixology/builtin";
 import {
     buildMixCardFreeformText,
     MIX_CARD_PROFILE_FALLBACK,
@@ -72,6 +73,10 @@ const KIND_GUIDE: Record<MixMaterialKind, { what: string; where: string }> = {
         what: "这里写小剧场：正文之外的加演，例如朋友圈动态、一段监控录像。契约决定 AI 何时写什么，渲染代码决定它长什么样；契约留空则为纯静态小品。",
         where: "契约进提示词；渲染代码只在界面执行。",
     },
+    checklist: {
+        what: "这里写输出格式检查：系统提示词最后一节的收尾核对清单，模型动笔前逐项核对本轮必须带上什么、禁止什么。一行一条，写得越具体越难被忽略。",
+        where: "进入系统提示词末尾「输出格式检查」段，紧挨对话历史；与序言同规则，槽里没装就没有这一段（官方出厂件在槽位候选里可选）。",
+    },
     mechanism: {
         what: "一段在沙盒里跑的逻辑，加一块常驻在对局画面上的界面。两半共用同一份存储，可以只写一半。",
         where: "不进提示词，跑在断网的沙盒里。",
@@ -88,10 +93,10 @@ const KIND_GUIDE: Record<MixMaterialKind, { what: string; where: string }> = {
  * 不进提示词的几种材料（外观/机括/滤网）不显示这行。
  */
 const HEADING_NOTE = "要在框里加小标题，用 ### 开头（# 和 ## 已被应用占用）。";
-const HEADING_NOTE_KINDS: MixMaterialKind[] = ["character", "persona", "base", "flavor", "glass", "strength", "ticket", "encore"];
+const HEADING_NOTE_KINDS: MixMaterialKind[] = ["character", "persona", "base", "flavor", "glass", "strength", "ticket", "encore", "checklist"];
 
 /** 文本类材料（序言/基底/风味/杯型/苦精）的字段名与示例 */
-const TEXT_FIELD_COPY: Record<"preface" | "base" | "flavor" | "glass" | "strength", { label: string; placeholder: string }> = {
+const TEXT_FIELD_COPY: Record<"preface" | "base" | "flavor" | "glass" | "strength" | "checklist", { label: string; placeholder: string }> = {
     preface: {
         label: "序言",
         placeholder: "例：\n这是一场沉浸式角色扮演，你要扮演的角色是{{char}}。下方依次给出扮演规则、角色资料与输出要求，请全部遵守；越靠后的要求优先级越高。\n（建议保留一句优先级声明，应用的段落排序依赖它。）",
@@ -111,6 +116,10 @@ const TEXT_FIELD_COPY: Record<"preface" | "base" | "flavor" | "glass" | "strengt
     strength: {
         label: "最高优先级要求",
         placeholder: "一到两条即可，例：\n始终保持{{char}}的克制感，不要替{{user}}总结感受。",
+    },
+    checklist: {
+        label: "输出格式检查",
+        placeholder: "系统提示词的最后一节，模型收尾前逐项核对的清单。槽里没装就没有这一段。例：\n每轮回复发出前逐项核对：\n- 正文符合「正文输出要求」。\n- 回复最开头已按「状态栏」的格式输出 [状态栏]...[/状态栏] 块——任何一轮都不能缺。\n- 回复末尾已写 [拍立得]...[/拍立得] 块——任何一轮都不能缺。\n- 已写〔记〕行；该归纳时写〔纳〕，该压核心时写〔核〕。",
     },
 };
 
@@ -188,8 +197,11 @@ export function MixMaterialEditor({ kind, initial, onSave, onCancel }: EditorPro
         initialCard?.examples ? initialCard.examples.map((e) => ({ ...e })) : [],
     );
     // 文本类 / 小票 / 装饰 / 尾调
+    // 新建「核对」时预填官方出厂件的清单（状态栏 + 小剧场各一块的通用版），作者在此基础上增删
     const [content, setContent] = useState(
-        initial && "content" in initial ? (initial as MixTextMaterial).content : "",
+        initial && "content" in initial
+            ? (initial as MixTextMaterial).content
+            : kind === "checklist" ? createBuiltinChecklist().content : "",
     );
     // 仅序言：各分段标题的覆写（留空的键用默认标题）
     const [sectionTitles, setSectionTitles] = useState<Partial<Record<MixSectionTitleKey, string>>>(
@@ -700,7 +712,7 @@ export function MixMaterialEditor({ kind, initial, onSave, onCancel }: EditorPro
                     </Field>
                 </>
             ) : null}
-            {kind === "preface" || kind === "base" || kind === "flavor" || kind === "glass" || kind === "strength" ? (
+            {kind === "preface" || kind === "base" || kind === "flavor" || kind === "glass" || kind === "strength" || kind === "checklist" ? (
                 <Field label={TEXT_FIELD_COPY[kind].label} hint="必填，可用 {{char}} / {{user}}">
                     <textarea
                         className="mix-textarea"
@@ -846,7 +858,7 @@ export function MixMaterialEditor({ kind, initial, onSave, onCancel }: EditorPro
                             style={{ minHeight: 200 }}
                             value={script}
                             onChange={(e) => setScript(e.target.value)}
-                            placeholder={trusted ? "信任模式：整段代码进对局时在页面里执行一次，用 mix 登记坑位和钩子。\n\nmix.slot(名字, (el, ctx) => { … return 清理函数 })   坑位：turn 每轮正文下方一块 / prose 每轮正文容器本身 / float 铺满对局画面的悬浮层 / bottom 最新一轮之下\n  ctx: { turnId, text, index, state, store, charName, userName }\nmix.on(时机, fn)   sessionStart / beforeSend / afterReply / sessionEnd（与沙盒同一套 ctx 与返回）；dialogue 收 { id, text, turnId }\nmix.state / mix.store / mix.setState(obj) / mix.setStore(obj) / mix.say(text) / mix.toast(text)\nmix.call(连接器名, 参数) → Promise<{status, data}> / mix.play(id, 音频, type) / mix.stop() / mix.mark(id, 状态) / mix.refresh()\n\n例：每轮正文下面画一行按钮，点了以玩家身份发言\nmix.slot('turn', function (el, ctx) {\n  el.innerHTML = '<button>继续</button>';\n  el.querySelector('button').onclick = function () { mix.say('（继续）'); };\n});\nmix.on('afterReply', function (ctx) { return { store: { 轮数: String(ctx.turnCount) } }; });" : "每个函数收一份 ctx，返回一个对象（不返回就是什么都不改）。\nctx: { turnCount, state, store, charName, userName, text, ticketRaw, encoreRaw }\n可返回: { text, note, state, store }\n\n例：玩家打「/掷骰」时换成一段带结果的指令\nfunction onBeforeSend(ctx) {\n  if (ctx.text !== \"/掷骰\") return;\n  var n = 1 + Math.floor(Math.random() * 20);\n  return { text: \"（我掷出了 \" + n + \" 点）\" };\n}\n\n例：连着三轮好感度上涨就提醒一次\nfunction onAfterReply(ctx) {\n  var up = Number(ctx.store.连涨 || 0);\n  return { store: { 连涨: String(up + 1) } };\n}"}
+                            placeholder={trusted ? "信任模式：整段代码进对局时在页面里执行一次，用 mix 登记坑位和钩子。\n\nmix.slot(名字, (el, ctx) => { … return 清理函数 })   坑位：turn 每轮正文下方一块 / prose 每轮正文容器本身 / float 铺满对局画面的悬浮层 / bottom 最新一轮之下\n  ctx: { turnId, text, index, state, store, charName, userName }\nmix.on(时机, fn)   sessionStart / beforeSend / rawReply / afterReply / sessionEnd（与沙盒同一套 ctx 与返回；rawReply 在剥状态栏前收 ctx.raw、可返回 raw）；dialogue 收 { id, text, turnId }\nmix.state / mix.store / mix.setState(obj) / mix.setStore(obj) / mix.say(text) / mix.toast(text)\nmix.call(连接器名, 参数) → Promise<{status, data}> / mix.play(id, 音频, type) / mix.stop() / mix.mark(id, 状态) / mix.refresh()\n\n例：每轮正文下面画一行按钮，点了以玩家身份发言\nmix.slot('turn', function (el, ctx) {\n  el.innerHTML = '<button>继续</button>';\n  el.querySelector('button').onclick = function () { mix.say('（继续）'); };\n});\nmix.on('afterReply', function (ctx) { return { store: { 轮数: String(ctx.turnCount) } }; });" : "每个函数收一份 ctx，返回一个对象（不返回就是什么都不改）。\nctx: { turnCount, state, store, charName, userName, text, ticketRaw, encoreRaw, lastReply（发送前：最近一条 AI 消息将发给模型的全文） }\n可返回: { text, note, sections, lastReply（整条换掉最近一条 AI 消息，只改请求不落库）, state, store }\n\n例：玩家打「/掷骰」时换成一段带结果的指令\nfunction onBeforeSend(ctx) {\n  if (ctx.text !== \"/掷骰\") return;\n  var n = 1 + Math.floor(Math.random() * 20);\n  return { text: \"（我掷出了 \" + n + \" 点）\" };\n}\n\n例：连着三轮好感度上涨就提醒一次\nfunction onAfterReply(ctx) {\n  var up = Number(ctx.store.连涨 || 0);\n  return { store: { 连涨: String(up + 1) } };\n}"}
                         />
                     </Field>
                     {trusted ? null : (

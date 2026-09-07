@@ -206,6 +206,18 @@ export const MIX_CRAFT_PROMPTS: Record<MixMaterialKind, string> = {
 
 【我的想法】：（想加演什么、长什么样、什么时候出现）`,
 
+    checklist: `请帮我写一份 AI 角色扮演提示词的"输出格式检查"：它是整份系统提示词的最后一节，紧挨着对话历史，模型每轮收尾前会逐项核对这份清单。清单里写的项目模型最不容易漏，没写进清单的附加输出（比如机括要求的标记块）经常被忘掉，所以把每一样"每轮必须出现的东西"都列成一条：状态栏块、小剧场块、机括要求的输出块、字数、内心独白次数等。只列核对项，不写解释。可用 {{char}} / {{user}}。
+
+请分段输出：
+【材料名】给这份清单起个名
+【一句话介绍】一行说清它管什么
+【标签】2~4 个短词，用顿号隔开
+【输出格式检查】第一行写「每轮回复发出前逐项核对：」，下面每条一行、以 - 开头，不要另加解释
+
+（若我在想法里注明「要 JSON」，请改为只输出（从 { 开始、到 } 结束，不要用 \`\`\` 代码块包裹、前后不加任何文字；字符串值内不允许出现真实换行或制表符（会直接导致导入失败），所有换行一律写成 \\n，长代码字段尤其要逐行检查；请用分行缩进的格式输出整个 JSON（不要压成一行，压成一行极易漏括号）；代码或正则里的一个反斜杠在 JSON 里写成两个，不要再多转一层）：{"kind":"checklist","name":"材料名","hook":"…","tags":["…"],"content":"正文"}，纯 JSON、字符串内换行写成 \\n。）
+
+【我的想法】：（这杯里装了哪些状态栏、小剧场、机括，各要求每轮输出什么）`,
+
     filter: `请帮我编写一组"正文清洗规则"，用于自动清理 AI 回复里的文字怪癖。每条规则包含三样：
 - 查找：JS 正则（自动加 g 标志，不要写斜杠定界符），可用捕获组；
 - 替换：替换文本（$1 引用捕获组；留空即删除）；
@@ -236,9 +248,12 @@ export const MIX_CRAFT_PROMPTS: Record<MixMaterialKind, string> = {
 若我的想法说得笼统：先在【玩法方案】里用一两句话复述你理解的玩法，把它拆成「钩子做什么 / 界面做什么 / 数据存哪」；拿不准就先做最小可用版本，最后列两三个可选扩展。
 
 ① 钩子逻辑（纯 JS，可选）：定义这些可选的全局函数，应用会在对应时机调用：
-function onSessionStart(ctx) / onBeforeSend(ctx) / onAfterReply(ctx) / onSessionEnd(ctx)
+function onSessionStart(ctx) / onBeforeSend(ctx) / onRawReply(ctx) / onAfterReply(ctx) / onSessionEnd(ctx)
 ctx 字段：turnCount 已发生轮数；state 记住的值；store 本机括自己的存储；charName / userName；text（发送前 = 玩家这句话，回复后 = 模型正文）；ticketRaw / encoreRaw（回复后的状态栏与小剧场原文）；edited（回复后专用：true 表示这是玩家编辑原文后手动要求的重跑，不是新生成。玩家选「替换」时应用已先把存储回滚到这一轮记账前，钩子照常当新一轮记就行；选「追加」则是在现有存储上再跑一遍。一般无需特殊处理，此标记仅供知情）。
-返回一个普通对象（各项都可省略）：{ text: 改写后的 text, note: 只在这一轮生效的临时提示（不限长度，写多少注入多少，用量自己把握）, sections: 挂进系统提示词的段, state: 要写入的记住值, store: 覆盖自己的存储 }。
+返回一个普通对象（各项都可省略）：{ text: 改写后的 text, raw: 改写后的模型原文（仅 onRawReply）, note: 只在这一轮生效的临时提示（不限长度，写多少注入多少，用量自己把握）, sections: 挂进系统提示词的段, lastReply: 改写后的最近一条 assistant 消息（仅 onBeforeSend）, state: 要写入的记住值, store: 覆盖自己的存储 }。
+onRawReply 在回复到手、剥状态栏/小剧场块之前跑：ctx.raw 是模型原文一个字不少，返回 { raw } 宿主就拿返回的这份去剥块、存库、画卡。用途：机括要模型伪装成状态栏写的块（如 [状态栏:拍立得]…[/状态栏]）在这里剪走存进 store，宿主就不会把它当状态栏画出来；下一轮再用 lastReply 放回历史。onAfterReply 照旧在剥完之后跑。
+lastReply 只在 onBeforeSend 里有效：ctx.lastReply 是最近一条 assistant 消息将要发给模型的完整文本（状态栏块 + 正文 + 小剧场块），返回同名字段就整条换掉——只改这次请求，不落库，界面与存档不动。典型用法：出杯后从正文里摘走的标记行/块存进 store，下一轮在 lastReply 里放回它当初的位置，模型每轮都能在历史里看到自己上一轮写过它（比只在提示词里要求稳得多）。多件机括按顺序接力，后一件看到的是前一件改过的版本。
+要模型每轮多写一段给机括用的东西（记忆行、拍摄单、选项之类）时的标准做法：契约用 sections 挂在 ticket 段（写成「## [状态栏:名字] 的输出契约」，说明它与其他状态栏一样放在回复最开头、[状态栏:名字] 起 [/状态栏] 止），模型就按它已经很熟的状态栏协议输出；onRawReply 里把这一块从原文剪走存进 store；onBeforeSend 里用 lastReply 把上一轮那块放回最近一条 assistant 消息、接在最后一个 [/状态栏] 之后；再用 sections 往 checklist 段挂一条核对项。四步缺一不可——只在提示词里要求、历史里没有示范，模型在长局里会越来越常漏写。
 sections 只在 onBeforeSend 里有效，形如 [{ at: "world", text: "## 记忆区\n…" }]：at 是分段键（base / character / persona / world / flavor / glass / ticket / encore / examples / checklist），text 原样接在那一段之后，标题自己带——写 # 就是独立一段，写 ## 就读作那一段的小节。note 挂在最末尾那条 user 消息，离模型开口最近，适合短提醒；sections 进系统提示词，适合档案、格式要求这类要和其他分段并列的内容。两者都只活这一轮，不落库，回溯不受影响。
 限制：单次执行 2 秒超时；无网络、碰不到页面。存储不设上限，但它随对局整份读写，写太大轮轮都要序列化，自己节制。
 
@@ -250,7 +265,7 @@ sections 只在 onBeforeSend 里有效，形如 [{ at: "world", text: "## 记忆
 
 ③ 信任模式（trusted: true，可选，慎用）：不进沙盒，script 在对局页面里执行一次（与聊天插件同环境），像插件一样拿裸 DOM，能画进正文、能自己 fetch；玩家装入/入柜/导入时会看到风险提示。此模式下不用 panelHtml，界面全由代码画。script 里可用全局 mix：
 - mix.slot(名字, (el, ctx) => { …; return 清理函数 })：坑位。"turn" 每轮 AI 回复下方一块空容器；"prose" 每轮正文容器本身（.mix-prose，可以查它里面的 .mix-dialogue / .mix-narration 等语义类并就地改 DOM）；"float" 铺满对局画面的透明层（你画的元素自己 position:absolute 定位）；"bottom" 最新一轮之下。ctx: { turnId, text（这一轮正文）, index, state, store, charName, userName }（float/bottom 没有 turn 相关字段）。同一坑位每轮各挂一次；state/store 变了会卸载重挂，返回的清理函数在卸载时调。
-- mix.on(时机, fn)：sessionStart / beforeSend / afterReply / sessionEnd 与沙盒钩子同一套 ctx 与返回值（{ text, note, sections, state, store }）；"dialogue" 收 { id, text, turnId }（材料声明了 dialogueButton 才有）。
+- mix.on(时机, fn)：sessionStart / beforeSend / rawReply / afterReply / sessionEnd 与沙盒钩子同一套 ctx 与返回值（{ text, raw, note, sections, lastReply, state, store }，含上面说的状态栏伪装块四步做法）；"dialogue" 收 { id, text, turnId }（材料声明了 dialogueButton 才有）。
 - mix.state / mix.store（读）、mix.setState(obj)、mix.setStore(obj)、mix.say(text)、mix.toast(text)、mix.mark(id, 状态)、mix.call(连接器名, 参数) → Promise、mix.play(id, 音频, type)、mix.stop()、mix.refresh()（全部坑位重挂）。
 - 不要在坑位回调里做昂贵计算或每轮联网；DOM 用应用已有的类名与配色（深色底、--mix-violet 主色），别把整页样式改掉。只在用户明确要"自由渲染进正文"或必须联网时用信任模式，其余一律沙盒。
 - 美学要求：形态跟着玩法走——一颗胶囊、一条窄边栏、一枚角标、一张卡片，或一块整面的仪表盘都可以。原则只有三条：默认别挡住对话（大面板要能收起或退场）；气质贴合对局，把它当世界里的道具来做（罗盘、签筒、终端、账本），不要做成工程感的调试面板；动效轻、不抢注意力。配色与深色界面协调。
@@ -316,6 +331,8 @@ renderHtml＝渲染代码完整 HTML；previewRaw＝壳内原文本身，不带 
 historyFeed＝历史回传（选填）："latest"（默认）只把最近一轮的小剧场原文回传给模型——格式示范够用，长局不费 token；"all" 全部轮次回传，仅当契约需要衔接往期小剧场剧情时才用；"none" 完全不回传，每出独立、不需要接续时最省 token。
 列表封面由渲染效果自动生成，不收 cover。
 图片细则：渲染代码里禁止编造图片外链；经图床上传得到的真实 URL 可以用。`,
+    checklist: `—— 工具字段对照 ——
+name＝材料名；hook＝一句话介绍；tags＝字符串数组；content＝输出格式检查正文（系统提示词最后一节的收尾核对清单，槽里没装就没有这一段，官方出厂件可选；每轮必须出现的东西逐条列出，含机括要求的输出块）。`,
     filter: `—— 工具字段对照 ——
 name＝材料名；hook＝一句话介绍；tags＝字符串数组；
 rules＝数组 [{"find":"正则本体（不带斜杠定界符）","replace":"替换文本（删除传空串）","mode":"display"|"context"}]。`,
